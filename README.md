@@ -29,9 +29,9 @@
 
 ## Telegram-команды
 
-Команды пишутся вашему Telegram-боту, который указан в `TELEGRAM_BOT_TOKEN`.
+Команды пишутся вашему Telegram-боту, который указан в `TELEGRAM_BOT_TOKEN` или `TG_BOT_TOKEN`.
 
-Доступ разрешен только чату из переменной `TELEGRAM_CHAT_ID`.
+Доступ разрешен только чату из переменной `TELEGRAM_CHAT_ID` или `TG_CHAT_ID`.
 
 ```text
 /next_events
@@ -84,6 +84,13 @@ TELEGRAM_BOT_TOKEN=токен_telegram_бота
 TELEGRAM_CHAT_ID=ваш_chat_id
 ```
 
+Если BotHost не сохраняет переменную `TELEGRAM_BOT_TOKEN`, используйте короткие имена:
+
+```env
+TG_BOT_TOKEN=токен_telegram_бота
+TG_CHAT_ID=ваш_chat_id
+```
+
 `TELEGRAM_BOT_TOKEN` вставляется без слова `bot` в начале. Правильно:
 
 ```env
@@ -118,7 +125,7 @@ Telegram-команды:
 Telegram API getUpdates failed: HTTP 404 {'ok': False, 'error_code': 404, 'description': 'Not Found'}
 ```
 
-значит Telegram не нашел бота по токену. Проверьте `TELEGRAM_BOT_TOKEN`: он должен быть токеном от `@BotFather`, без лишних пробелов, кавычек и без слова `bot` в начале.
+значит Telegram не нашел бота по токену. Проверьте `TELEGRAM_BOT_TOKEN` или `TG_BOT_TOKEN`: он должен быть токеном от `@BotFather`, без лишних пробелов, кавычек и без слова `bot` в начале.
 
 ## Конфиг событий
 
@@ -172,6 +179,8 @@ LOG_LEVEL=INFO
 LOCK_FILE=.bot.lock
 TELEGRAM_BOT_TOKEN=токен_telegram_бота
 TELEGRAM_CHAT_ID=ваш_chat_id
+TG_BOT_TOKEN=
+TG_CHAT_ID=
 ENABLE_DISCORD_COMMANDS=false
 DISCORD_GUILD_ID=
 ```

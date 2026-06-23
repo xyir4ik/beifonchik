@@ -27,6 +27,14 @@ logging.basicConfig(
 logger = logging.getLogger("scheduled-discord-bot")
 
 
+def get_env_first(*names: str) -> str | None:
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return None
+
+
 @dataclass(frozen=True)
 class ScheduledEvent:
     name: str
@@ -248,8 +256,8 @@ def read_config() -> BotConfig:
         events=read_events(),
         timezone=ZoneInfo(timezone_name),
         guild_id=guild_id,
-        telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN") or None,
-        telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID") or None,
+        telegram_bot_token=get_env_first("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN"),
+        telegram_chat_id=get_env_first("TELEGRAM_CHAT_ID", "TG_CHAT_ID"),
         enable_discord_commands=parse_bool(os.getenv("ENABLE_DISCORD_COMMANDS"), default=False),
     )
 
@@ -274,8 +282,8 @@ def build_allowed_mentions(mode: str) -> discord.AllowedMentions:
 
 def build_notifier_from_env() -> TelegramNotifier:
     return TelegramNotifier(
-        bot_token=os.getenv("TELEGRAM_BOT_TOKEN") or None,
-        chat_id=os.getenv("TELEGRAM_CHAT_ID") or None,
+        bot_token=get_env_first("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN"),
+        chat_id=get_env_first("TELEGRAM_CHAT_ID", "TG_CHAT_ID"),
     )
 
 
@@ -389,7 +397,9 @@ class ScheduledDiscordBot(discord.Client):
 
     def start_telegram_commands(self) -> None:
         if not self.notifier.enabled:
-            logger.info("Telegram commands are disabled because TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not set")
+            logger.info(
+                "Telegram commands are disabled because TELEGRAM_BOT_TOKEN/TG_BOT_TOKEN or TELEGRAM_CHAT_ID/TG_CHAT_ID is not set"
+            )
             return
         if self._telegram_task and not self._telegram_task.done():
             return
@@ -404,7 +414,7 @@ class ScheduledDiscordBot(discord.Client):
             updates = await self.notifier.get_updates(offset=offset, timeout_seconds=30)
             if updates is None:
                 logger.error(
-                    "Telegram getUpdates failed. Check TELEGRAM_BOT_TOKEN. Retrying in 60 seconds."
+                    "Telegram getUpdates failed. Check TELEGRAM_BOT_TOKEN or TG_BOT_TOKEN. Retrying in 60 seconds."
                 )
                 await asyncio.sleep(60)
                 continue
@@ -421,7 +431,7 @@ class ScheduledDiscordBot(discord.Client):
         updates = await self.notifier.get_updates(offset=None, timeout_seconds=1)
         if updates is None:
             logger.error(
-                "Telegram getUpdates failed during startup. Check TELEGRAM_BOT_TOKEN."
+                "Telegram getUpdates failed during startup. Check TELEGRAM_BOT_TOKEN or TG_BOT_TOKEN."
             )
             return None
 
