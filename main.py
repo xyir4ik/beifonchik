@@ -8,10 +8,11 @@ from datetime import datetime
 from pathlib import Path
 from types import TracebackType
 
+import aiohttp
 import discord
-from discord import app_commands
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from discord import app_commands
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 
@@ -40,6 +41,36 @@ class BotConfig:
     events: list[ScheduledEvent]
     timezone: ZoneInfo
     guild_id: int | None = None
+    telegram_bot_token: str | None = None
+    telegram_chat_id: str | None = None
+
+
+class TelegramNotifier:
+    def __init__(self, bot_token: str | None, chat_id: str | None) -> None:
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+        self.enabled = bool(bot_token and chat_id)
+
+    async def send(self, text: str) -> None:
+        if not self.enabled:
+            return
+
+        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
+        payload = {
+            "chat_id": self.chat_id,
+            "text": text[:3900],
+            "disable_web_page_preview": True,
+        }
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=10)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=payload) as response:
+                    if response.status >= 400:
+                        body = await response.text()
+                        logger.error("Telegram notification failed: HTTP %s %s", response.status, body)
+        except Exception:
+            logger.exception("Telegram notification failed")
 
 
 class SingleInstanceLock:
@@ -113,8 +144,6 @@ def read_events() -> list[ScheduledEvent]:
     else:
         raise ValueError(f"{source} must contain a JSON object or array of events")
 
-    events: list[ScheduledEvent] = []
-    event_names: set[str] = set()
     if not isinstance(raw_events_list, list):
         raise ValueError(f"{source} must contain an events array")
 
@@ -123,6 +152,8 @@ def read_events() -> list[ScheduledEvent]:
     default_reaction = defaults.get("reaction")
     default_allowed_mentions = defaults.get("allowed_mentions", "none")
 
+    events: list[ScheduledEvent] = []
+    event_names: set[str] = set()
     for index, item in enumerate(raw_events_list, start=1):
         if not isinstance(item, dict):
             raise ValueError(f"Event #{index} must be a JSON object")
@@ -178,6 +209,8 @@ def read_config() -> BotConfig:
         events=read_events(),
         timezone=ZoneInfo(timezone_name),
         guild_id=guild_id,
+        telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN") or None,
+        telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID") or None,
     )
 
 
@@ -199,15 +232,38 @@ def build_allowed_mentions(mode: str) -> discord.AllowedMentions:
     return discord.AllowedMentions.none()
 
 
+def build_notifier_from_env() -> TelegramNotifier:
+    return TelegramNotifier(
+        bot_token=os.getenv("TELEGRAM_BOT_TOKEN") or None,
+        chat_id=os.getenv("TELEGRAM_CHAT_ID") or None,
+    )
+
+
+async def notify_runtime_error(notifier: TelegramNotifier, exc: BaseException) -> None:
+    if str(exc) == "Another bot process is already running":
+        await notifier.send(
+            "⚠️ Вторая копия бота остановлена\n\n"
+            "Причина: другая копия уже запущена.\n"
+            "Сообщения по расписанию не будут дублироваться."
+        )
+        return
+
+    await notifier.send(
+        "💥 Бот аварийно завершился\n\n"
+        f"Ошибка:\n{type(exc).__name__}: {exc}"
+    )
+
+
 class ScheduledDiscordBot(discord.Client):
-    def __init__(self, events: list[ScheduledEvent], timezone: ZoneInfo, guild_id: int | None) -> None:
+    def __init__(self, config: BotConfig, notifier: TelegramNotifier) -> None:
         intents = discord.Intents.default()
         super().__init__(intents=intents)
 
-        self.events = events
-        self.scheduler = AsyncIOScheduler(timezone=timezone)
-        self.timezone = timezone
-        self.guild_id = guild_id
+        self.events = config.events
+        self.scheduler = AsyncIOScheduler(timezone=config.timezone)
+        self.timezone = config.timezone
+        self.guild_id = config.guild_id
+        self.notifier = notifier
         self.tree = app_commands.CommandTree(self)
         self._scheduled = False
         self._commands_synced = False
@@ -216,6 +272,10 @@ class ScheduledDiscordBot(discord.Client):
             name="send_now",
             description="Send one scheduled message by name, or all messages when event_name is empty.",
         )(self.send_now_command)
+        self.tree.command(
+            name="next_events",
+            description="Show upcoming scheduled messages.",
+        )(self.next_events_command)
 
     async def on_ready(self) -> None:
         logger.info("Logged in as %s (%s)", self.user, self.user.id if self.user else "unknown")
@@ -241,6 +301,7 @@ class ScheduledDiscordBot(discord.Client):
         self.scheduler.start()
         self._scheduled = True
         self.log_next_runs()
+        await self.notify_started()
 
     async def sync_commands(self) -> None:
         if self._commands_synced:
@@ -259,20 +320,65 @@ class ScheduledDiscordBot(discord.Client):
             logger.exception(
                 "Could not sync slash commands. Check DISCORD_GUILD_ID and invite the bot with applications.commands scope. Scheduled messages will still run."
             )
-        except discord.HTTPException:
+            await self.notifier.send(
+                "⚠️ Slash-команды не подключились\n\n"
+                "Команды: /send_now и /next_events\n"
+                "Ошибка: Discord вернул Missing Access\n\n"
+                "Проверьте:\n"
+                "• бот приглашен на сервер\n"
+                "• при приглашении выбран applications.commands\n"
+                "• DISCORD_GUILD_ID — это ID сервера, а не канала или роли\n\n"
+                "Расписание продолжит работать."
+            )
+        except discord.HTTPException as exc:
             logger.exception("Discord API error while syncing slash commands. Scheduled messages will still run.")
+            await self.notifier.send(
+                "⚠️ Slash-команды не подключились\n\n"
+                "Команды: /send_now и /next_events\n"
+                f"Ошибка Discord API: {exc}\n\n"
+                "Расписание продолжит работать."
+            )
         finally:
             self._commands_synced = True
 
-    def log_next_runs(self) -> None:
+    def get_next_runs(self) -> list[tuple[ScheduledEvent, datetime]]:
+        next_runs: list[tuple[ScheduledEvent, datetime]] = []
         for event in self.events:
             job = self.scheduler.get_job(event.name)
             if job is None or job.next_run_time is None:
-                logger.warning("No next run time for %s", event.name)
                 continue
+            next_runs.append((event, job.next_run_time.astimezone(self.timezone)))
 
-            next_run = job.next_run_time.astimezone(self.timezone)
+        return sorted(next_runs, key=lambda item: item[1])
+
+    def log_next_runs(self) -> None:
+        logged_events = set()
+        for event, next_run in self.get_next_runs():
+            logged_events.add(event.name)
             logger.info("Next %s: %s", event.name, next_run.strftime("%Y-%m-%d %H:%M %Z"))
+
+        for event in self.events:
+            if event.name not in logged_events:
+                logger.warning("No next run time for %s", event.name)
+
+    def format_next_events(self, limit: int = 5) -> str:
+        next_runs = self.get_next_runs()[:limit]
+        if not next_runs:
+            return "Ближайшие события не найдены."
+
+        lines = ["Ближайшие события:"]
+        for event, next_run in next_runs:
+            lines.append(f"• {event.name} — {next_run.strftime('%d.%m.%Y %H:%M МСК')}")
+        return "\n".join(lines)
+
+    async def notify_started(self) -> None:
+        user = f"{self.user}" if self.user else "неизвестно"
+        await self.notifier.send(
+            "✅ Бот запущен\n\n"
+            f"Аккаунт: {user}\n"
+            f"Событий в расписании: {len(self.events)}\n\n"
+            f"{self.format_next_events(limit=5)}"
+        )
 
     async def send_scheduled_message(self, event: ScheduledEvent) -> bool:
         try:
@@ -283,21 +389,72 @@ class ScheduledDiscordBot(discord.Client):
             send = getattr(channel, "send", None)
             if not callable(send):
                 logger.error("Channel %s for event %s is not messageable", event.channel_id, event.name)
+                await self.notifier.send(
+                    "❌ Ошибка отправки сообщения\n\n"
+                    f"Событие: {event.name}\n"
+                    f"Канал: {event.channel_id}\n"
+                    f"Текст: {event.text}\n\n"
+                    "Ошибка: канал не поддерживает отправку сообщений"
+                )
                 return False
 
             message = await send(
                 event.text,
                 allowed_mentions=build_allowed_mentions(event.allowed_mentions),
             )
-            await message.add_reaction(event.reaction)
+
+            try:
+                await message.add_reaction(event.reaction)
+            except discord.Forbidden:
+                logger.exception("Missing Discord permissions to add reaction for event %s", event.name)
+                await self.notifier.send(
+                    "⚠️ Сообщение отправлено, но реакция не поставилась\n\n"
+                    f"Событие: {event.name}\n"
+                    f"Канал: {event.channel_id}\n"
+                    f"Реакция: {event.reaction}\n\n"
+                    "Ошибка: нет прав Discord на добавление реакции"
+                )
+                return False
+            except discord.HTTPException as exc:
+                logger.exception("Discord API error while adding reaction for event %s", event.name)
+                await self.notifier.send(
+                    "⚠️ Сообщение отправлено, но реакция не поставилась\n\n"
+                    f"Событие: {event.name}\n"
+                    f"Канал: {event.channel_id}\n"
+                    f"Реакция: {event.reaction}\n\n"
+                    f"Ошибка Discord API: {exc}"
+                )
+                return False
+
             logger.info("Sent scheduled message for event %s", event.name)
             return True
-        except discord.Forbidden:
+        except discord.Forbidden as exc:
             logger.exception("Missing Discord permissions for event %s", event.name)
-        except discord.HTTPException:
+            await self.notifier.send(
+                "❌ Ошибка отправки сообщения\n\n"
+                f"Событие: {event.name}\n"
+                f"Канал: {event.channel_id}\n"
+                f"Текст: {event.text}\n\n"
+                f"Ошибка: нет прав Discord на отправку сообщения\n{exc}"
+            )
+        except discord.HTTPException as exc:
             logger.exception("Discord API error while sending event %s", event.name)
-        except Exception:
+            await self.notifier.send(
+                "❌ Ошибка отправки сообщения\n\n"
+                f"Событие: {event.name}\n"
+                f"Канал: {event.channel_id}\n"
+                f"Текст: {event.text}\n\n"
+                f"Ошибка Discord API: {exc}"
+            )
+        except Exception as exc:
             logger.exception("Unexpected error while sending event %s", event.name)
+            await self.notifier.send(
+                "❌ Неожиданная ошибка отправки сообщения\n\n"
+                f"Событие: {event.name}\n"
+                f"Канал: {event.channel_id}\n"
+                f"Текст: {event.text}\n\n"
+                f"Ошибка: {type(exc).__name__}: {exc}"
+            )
         return False
 
     async def send_now_command(self, interaction: discord.Interaction, event_name: str = "") -> None:
@@ -331,14 +488,27 @@ class ScheduledDiscordBot(discord.Client):
             f"Готово: отправлено {sent_count} из {len(selected_events)} сообщений.",
             ephemeral=True,
         )
+        await self.notifier.send(
+            "ℹ️ Ручная отправка через /send_now\n\n"
+            f"Пользователь: {interaction.user}\n"
+            f"Событий отправлено: {sent_count} из {len(selected_events)}"
+        )
+
+    async def next_events_command(self, interaction: discord.Interaction, limit: int = 5) -> None:
+        if not self.can_use_manual_command(interaction):
+            await interaction.response.send_message(
+                "Эта команда доступна только администраторам или пользователям с правом Manage Server.",
+                ephemeral=True,
+            )
+            return
+
+        limit = max(1, min(limit, 10))
+        await interaction.response.send_message(self.format_next_events(limit=limit), ephemeral=True)
 
     @staticmethod
     def can_use_manual_command(interaction: discord.Interaction) -> bool:
         permissions = getattr(interaction.user, "guild_permissions", None)
-        return bool(
-            permissions
-            and (permissions.administrator or permissions.manage_guild)
-        )
+        return bool(permissions and (permissions.administrator or permissions.manage_guild))
 
 
 async def main() -> None:
@@ -347,21 +517,25 @@ async def main() -> None:
         raise RuntimeError("DISCORD_TOKEN environment variable is required")
 
     config = read_config()
+    notifier = TelegramNotifier(config.telegram_bot_token, config.telegram_chat_id)
 
-    bot = ScheduledDiscordBot(
-        events=config.events,
-        timezone=config.timezone,
-        guild_id=config.guild_id,
-    )
+    bot = ScheduledDiscordBot(config=config, notifier=notifier)
     async with bot:
         await bot.start(token)
 
 
 if __name__ == "__main__":
     lock_file = Path(os.getenv("LOCK_FILE", ".bot.lock"))
+    startup_notifier = build_notifier_from_env()
+
     try:
         with SingleInstanceLock(lock_file):
             asyncio.run(main())
     except RuntimeError as exc:
         logger.error("%s", exc)
+        asyncio.run(notify_runtime_error(startup_notifier, exc))
+        sys.exit(1)
+    except Exception as exc:
+        logger.exception("Bot crashed")
+        asyncio.run(notify_runtime_error(startup_notifier, exc))
         sys.exit(1)

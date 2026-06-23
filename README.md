@@ -5,6 +5,8 @@
 Дополнительно есть:
 
 - slash-команда `/send_now` для ручной отправки сообщений;
+- slash-команда `/next_events` для просмотра ближайших событий;
+- Telegram-уведомления на русском о запуске, ошибках и ручных отправках;
 - лог ближайшего времени срабатывания каждого события;
 - защита от случайного запуска двух копий бота;
 - удобный `events.json`, где канал, роль и реакция указываются один раз.
@@ -53,13 +55,14 @@
 
 ## Slash-команда
 
-Бот регистрирует команду:
+Бот регистрирует команды:
 
 ```text
 /send_now
+/next_events
 ```
 
-Без параметров команда отправит все сообщения из `events.json` сразу.
+`/send_now` без параметров отправит все сообщения из `events.json` сразу.
 
 Можно отправить одно событие по имени:
 
@@ -67,7 +70,14 @@
 /send_now event_name: weekly_25x25_common_monday
 ```
 
-Командой могут пользоваться только пользователи с правом `Administrator` или `Manage Server`.
+`/next_events` покажет ближайшие события:
+
+```text
+/next_events
+/next_events limit: 10
+```
+
+Командами могут пользоваться только пользователи с правом `Administrator` или `Manage Server`.
 
 Чтобы slash-команда появилась быстро, добавьте в переменные окружения ID сервера:
 
@@ -76,6 +86,57 @@ DISCORD_GUILD_ID=ваш_id_сервера
 ```
 
 Если `DISCORD_GUILD_ID` не указан, команда синхронизируется глобально и может появиться в Discord не сразу.
+
+## Telegram-уведомления
+
+Telegram-уведомления опциональны. Если переменные не указаны, бот продолжит работать без них.
+
+Чтобы включить уведомления:
+
+1. Откройте Telegram и напишите `@BotFather`.
+2. Создайте бота командой `/newbot`.
+3. Скопируйте токен Telegram-бота.
+4. Напишите любое сообщение созданному Telegram-боту.
+5. Узнайте свой `chat_id`, например через `@userinfobot` или через запрос:
+
+```text
+https://api.telegram.org/botTELEGRAM_BOT_TOKEN/getUpdates
+```
+
+На BotHost добавьте переменные:
+
+```env
+TELEGRAM_BOT_TOKEN=токен_telegram_бота
+TELEGRAM_CHAT_ID=ваш_chat_id
+```
+
+Бот будет присылать уведомления на русском:
+
+```text
+✅ Бот запущен
+
+Аккаунт: бейфончик#0638
+Событий в расписании: 5
+
+Ближайшие события:
+• weekly_25x25_common_thursday — 25.06.2026 18:20 МСК
+```
+
+```text
+❌ Ошибка отправки сообщения
+
+Событие: weekly_25x25_common_thursday
+Канал: 1199512515755909171
+Ошибка: нет прав Discord на отправку сообщения
+```
+
+```text
+⚠️ Сообщение отправлено, но реакция не поставилась
+```
+
+```text
+💥 Бот аварийно завершился
+```
 
 ## Права бота в Discord
 
@@ -122,6 +183,8 @@ EVENTS_FILE=events.json
 LOG_LEVEL=INFO
 DISCORD_GUILD_ID=
 LOCK_FILE=.bot.lock
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
 ```
 
 Установите зависимости:
@@ -202,6 +265,8 @@ EVENTS_FILE=events.json
 LOG_LEVEL=INFO
 DISCORD_GUILD_ID=ваш_id_сервера
 LOCK_FILE=.bot.lock
+TELEGRAM_BOT_TOKEN=токен_telegram_бота
+TELEGRAM_CHAT_ID=ваш_chat_id
 ```
 
 7. Сохраните настройки и запустите/перезапустите бота.
@@ -210,7 +275,7 @@ LOCK_FILE=.bot.lock
 
 ```text
 Logged in as ...
-Synced 1 slash command(s) to guild ...
+Synced 2 slash command(s) to guild ...
 Scheduled weekly_15x15_vzp_saturday with cron '10 18 * * sat'
 Next weekly_15x15_vzp_saturday: ... MSK
 Scheduler started
@@ -231,9 +296,9 @@ Scheduler started
 403 Forbidden (error code: 50001): Missing Access
 ```
 
-значит Discord не дал боту зарегистрировать slash-команду на указанном сервере. Обычно причина в том, что в `DISCORD_GUILD_ID` указан ID канала/роли вместо ID сервера, или бот был приглашен без scope `applications.commands`.
+значит Discord не дал боту зарегистрировать slash-команды на указанном сервере. Обычно причина в том, что в `DISCORD_GUILD_ID` указан ID канала/роли вместо ID сервера, или бот был приглашен без scope `applications.commands`.
 
-Расписание при такой ошибке продолжит работать. Не будет работать только slash-команда `/send_now`, пока не исправить доступ.
+Расписание при такой ошибке продолжит работать. Не будут работать только slash-команды `/send_now` и `/next_events`, пока не исправить доступ.
 
 ## Python
 
