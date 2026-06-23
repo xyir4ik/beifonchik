@@ -84,6 +84,18 @@ TELEGRAM_BOT_TOKEN=токен_telegram_бота
 TELEGRAM_CHAT_ID=ваш_chat_id
 ```
 
+`TELEGRAM_BOT_TOKEN` вставляется без слова `bot` в начале. Правильно:
+
+```env
+TELEGRAM_BOT_TOKEN=1234567890:AA...
+```
+
+Неправильно:
+
+```env
+TELEGRAM_BOT_TOKEN=bot1234567890:AA...
+```
+
 При запуске придет сообщение:
 
 ```text
@@ -99,6 +111,14 @@ Telegram-команды:
 /next_events
 /send_now
 ```
+
+Если в логах есть ошибка:
+
+```text
+Telegram API getUpdates failed: HTTP 404 {'ok': False, 'error_code': 404, 'description': 'Not Found'}
+```
+
+значит Telegram не нашел бота по токену. Проверьте `TELEGRAM_BOT_TOKEN`: он должен быть токеном от `@BotFather`, без лишних пробелов, кавычек и без слова `bot` в начале.
 
 ## Конфиг событий
 

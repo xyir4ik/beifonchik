@@ -91,7 +91,7 @@ class TelegramNotifier:
             },
         )
 
-    async def get_updates(self, offset: int | None, timeout_seconds: int = 30) -> list[dict[str, Any]]:
+    async def get_updates(self, offset: int | None, timeout_seconds: int = 30) -> list[dict[str, Any]] | None:
         if not self.bot_token:
             return []
 
@@ -103,7 +103,7 @@ class TelegramNotifier:
             payload["offset"] = offset
 
         result = await self.api_request("getUpdates", payload, timeout_seconds=timeout_seconds + 5)
-        return result if isinstance(result, list) else []
+        return result if isinstance(result, list) else None
 
 
 class SingleInstanceLock:
@@ -402,6 +402,13 @@ class ScheduledDiscordBot(discord.Client):
 
         while not self.is_closed():
             updates = await self.notifier.get_updates(offset=offset, timeout_seconds=30)
+            if updates is None:
+                logger.error(
+                    "Telegram getUpdates failed. Check TELEGRAM_BOT_TOKEN. Retrying in 60 seconds."
+                )
+                await asyncio.sleep(60)
+                continue
+
             for update in updates:
                 update_id = update.get("update_id")
                 if isinstance(update_id, int):
@@ -412,6 +419,12 @@ class ScheduledDiscordBot(discord.Client):
 
     async def get_initial_telegram_offset(self) -> int | None:
         updates = await self.notifier.get_updates(offset=None, timeout_seconds=1)
+        if updates is None:
+            logger.error(
+                "Telegram getUpdates failed during startup. Check TELEGRAM_BOT_TOKEN."
+            )
+            return None
+
         update_ids = [update.get("update_id") for update in updates if isinstance(update.get("update_id"), int)]
         if not update_ids:
             return None
