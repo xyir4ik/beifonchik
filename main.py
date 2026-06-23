@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from types import TracebackType
+from typing import Any
 
 import aiohttp
 import discord
@@ -43,34 +44,66 @@ class BotConfig:
     guild_id: int | None = None
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
+    enable_discord_commands: bool = False
 
 
 class TelegramNotifier:
     def __init__(self, bot_token: str | None, chat_id: str | None) -> None:
         self.bot_token = bot_token
-        self.chat_id = chat_id
+        self.chat_id = str(chat_id) if chat_id else None
         self.enabled = bool(bot_token and chat_id)
 
-    async def send(self, text: str) -> None:
-        if not self.enabled:
-            return
+    async def api_request(self, method: str, payload: dict[str, Any], timeout_seconds: int = 10) -> Any | None:
+        if not self.bot_token:
+            return None
 
-        url = f"https://api.telegram.org/bot{self.bot_token}/sendMessage"
-        payload = {
-            "chat_id": self.chat_id,
-            "text": text[:3900],
-            "disable_web_page_preview": True,
-        }
+        url = f"https://api.telegram.org/bot{self.bot_token}/{method}"
 
         try:
-            timeout = aiohttp.ClientTimeout(total=10)
+            timeout = aiohttp.ClientTimeout(total=timeout_seconds)
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=payload) as response:
-                    if response.status >= 400:
-                        body = await response.text()
-                        logger.error("Telegram notification failed: HTTP %s %s", response.status, body)
+                    body = await response.json(content_type=None)
+                    if response.status >= 400 or not body.get("ok"):
+                        logger.error("Telegram API %s failed: HTTP %s %s", method, response.status, body)
+                        return None
+                    return body.get("result")
         except Exception:
-            logger.exception("Telegram notification failed")
+            logger.exception("Telegram API %s failed", method)
+            return None
+
+    async def send(self, text: str) -> None:
+        if not self.enabled or not self.chat_id:
+            return
+
+        await self.send_to_chat(self.chat_id, text)
+
+    async def send_to_chat(self, chat_id: str | int, text: str) -> None:
+        if not self.bot_token:
+            return
+
+        await self.api_request(
+            "sendMessage",
+            {
+                "chat_id": str(chat_id),
+                "text": text[:3900],
+                "disable_web_page_preview": True,
+            },
+        )
+
+    async def get_updates(self, offset: int | None, timeout_seconds: int = 30) -> list[dict[str, Any]]:
+        if not self.bot_token:
+            return []
+
+        payload: dict[str, Any] = {
+            "timeout": timeout_seconds,
+            "allowed_updates": ["message"],
+        }
+        if offset is not None:
+            payload["offset"] = offset
+
+        result = await self.api_request("getUpdates", payload, timeout_seconds=timeout_seconds + 5)
+        return result if isinstance(result, list) else []
 
 
 class SingleInstanceLock:
@@ -122,6 +155,12 @@ class SingleInstanceLock:
                 fcntl.flock(self.file.fileno(), fcntl.LOCK_UN)
         finally:
             self.file.close()
+
+
+def parse_bool(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def read_events() -> list[ScheduledEvent]:
@@ -211,6 +250,7 @@ def read_config() -> BotConfig:
         guild_id=guild_id,
         telegram_bot_token=os.getenv("TELEGRAM_BOT_TOKEN") or None,
         telegram_chat_id=os.getenv("TELEGRAM_CHAT_ID") or None,
+        enable_discord_commands=parse_bool(os.getenv("ENABLE_DISCORD_COMMANDS"), default=False),
     )
 
 
@@ -242,14 +282,14 @@ def build_notifier_from_env() -> TelegramNotifier:
 async def notify_runtime_error(notifier: TelegramNotifier, exc: BaseException) -> None:
     if str(exc) == "Another bot process is already running":
         await notifier.send(
-            "⚠️ Вторая копия бота остановлена\n\n"
+            "Вторая копия бота остановлена\n\n"
             "Причина: другая копия уже запущена.\n"
             "Сообщения по расписанию не будут дублироваться."
         )
         return
 
     await notifier.send(
-        "💥 Бот аварийно завершился\n\n"
+        "Бот аварийно завершился\n\n"
         f"Ошибка:\n{type(exc).__name__}: {exc}"
     )
 
@@ -263,24 +303,28 @@ class ScheduledDiscordBot(discord.Client):
         self.scheduler = AsyncIOScheduler(timezone=config.timezone)
         self.timezone = config.timezone
         self.guild_id = config.guild_id
+        self.enable_discord_commands = config.enable_discord_commands
         self.notifier = notifier
-        self.tree = app_commands.CommandTree(self)
+        self.tree: app_commands.CommandTree | None = None
         self._scheduled = False
         self._commands_synced = False
+        self._telegram_task: asyncio.Task[None] | None = None
 
-        self.tree.command(
-            name="send_now",
-            description="Send one scheduled message by name, or all messages when event_name is empty.",
-        )(self.send_now_command)
-        self.tree.command(
-            name="next_events",
-            description="Show upcoming scheduled messages.",
-        )(self.next_events_command)
+        if self.enable_discord_commands:
+            self.tree = app_commands.CommandTree(self)
+            self.tree.command(
+                name="send_now",
+                description="Send one scheduled message by name, or all messages when event_name is empty.",
+            )(self.discord_send_now_command)
+            self.tree.command(
+                name="next_events",
+                description="Show upcoming scheduled messages.",
+            )(self.discord_next_events_command)
 
     async def on_ready(self) -> None:
         logger.info("Logged in as %s (%s)", self.user, self.user.id if self.user else "unknown")
 
-        await self.sync_commands()
+        await self.sync_discord_commands()
 
         if self._scheduled:
             return
@@ -302,9 +346,15 @@ class ScheduledDiscordBot(discord.Client):
         self._scheduled = True
         self.log_next_runs()
         await self.notify_started()
+        self.start_telegram_commands()
 
-    async def sync_commands(self) -> None:
-        if self._commands_synced:
+    async def close(self) -> None:
+        if self._telegram_task:
+            self._telegram_task.cancel()
+        await super().close()
+
+    async def sync_discord_commands(self) -> None:
+        if not self.enable_discord_commands or self.tree is None or self._commands_synced:
             return
 
         try:
@@ -312,34 +362,145 @@ class ScheduledDiscordBot(discord.Client):
                 guild = discord.Object(id=self.guild_id)
                 self.tree.copy_global_to(guild=guild)
                 synced = await self.tree.sync(guild=guild)
-                logger.info("Synced %s slash command(s) to guild %s", len(synced), self.guild_id)
+                logger.info("Synced %s Discord slash command(s) to guild %s", len(synced), self.guild_id)
             else:
                 synced = await self.tree.sync()
-                logger.info("Synced %s global slash command(s)", len(synced))
+                logger.info("Synced %s global Discord slash command(s)", len(synced))
         except discord.Forbidden:
             logger.exception(
-                "Could not sync slash commands. Check DISCORD_GUILD_ID and invite the bot with applications.commands scope. Scheduled messages will still run."
+                "Could not sync Discord slash commands. Check DISCORD_GUILD_ID and applications.commands scope. Scheduled messages will still run."
             )
             await self.notifier.send(
-                "⚠️ Slash-команды не подключились\n\n"
+                "Discord slash-команды не подключились\n\n"
                 "Команды: /send_now и /next_events\n"
                 "Ошибка: Discord вернул Missing Access\n\n"
-                "Проверьте:\n"
-                "• бот приглашен на сервер\n"
-                "• при приглашении выбран applications.commands\n"
-                "• DISCORD_GUILD_ID — это ID сервера, а не канала или роли\n\n"
-                "Расписание продолжит работать."
+                "Расписание и Telegram-команды продолжат работать."
             )
         except discord.HTTPException as exc:
             logger.exception("Discord API error while syncing slash commands. Scheduled messages will still run.")
             await self.notifier.send(
-                "⚠️ Slash-команды не подключились\n\n"
+                "Discord slash-команды не подключились\n\n"
                 "Команды: /send_now и /next_events\n"
                 f"Ошибка Discord API: {exc}\n\n"
-                "Расписание продолжит работать."
+                "Расписание и Telegram-команды продолжат работать."
             )
         finally:
             self._commands_synced = True
+
+    def start_telegram_commands(self) -> None:
+        if not self.notifier.enabled:
+            logger.info("Telegram commands are disabled because TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is not set")
+            return
+        if self._telegram_task and not self._telegram_task.done():
+            return
+
+        self._telegram_task = asyncio.create_task(self.telegram_polling_loop())
+        logger.info("Telegram commands polling started")
+
+    async def telegram_polling_loop(self) -> None:
+        offset = await self.get_initial_telegram_offset()
+
+        while not self.is_closed():
+            updates = await self.notifier.get_updates(offset=offset, timeout_seconds=30)
+            for update in updates:
+                update_id = update.get("update_id")
+                if isinstance(update_id, int):
+                    offset = update_id + 1
+                await self.handle_telegram_update(update)
+
+            await asyncio.sleep(0.2)
+
+    async def get_initial_telegram_offset(self) -> int | None:
+        updates = await self.notifier.get_updates(offset=None, timeout_seconds=1)
+        update_ids = [update.get("update_id") for update in updates if isinstance(update.get("update_id"), int)]
+        if not update_ids:
+            return None
+        return max(update_ids) + 1
+
+    async def handle_telegram_update(self, update: dict[str, Any]) -> None:
+        message = update.get("message")
+        if not isinstance(message, dict):
+            return
+
+        chat = message.get("chat")
+        if not isinstance(chat, dict):
+            return
+
+        chat_id = str(chat.get("id"))
+        if chat_id != self.notifier.chat_id:
+            logger.warning("Ignoring Telegram command from unauthorized chat_id=%s", chat_id)
+            return
+
+        text = str(message.get("text") or "").strip()
+        if not text.startswith("/"):
+            return
+
+        command, _, argument = text.partition(" ")
+        command = command.split("@", 1)[0].lower()
+        argument = argument.strip()
+
+        if command in {"/start", "/help"}:
+            await self.notifier.send(self.telegram_help_text())
+        elif command == "/next_events":
+            await self.handle_telegram_next_events(argument)
+        elif command == "/send_now":
+            await self.handle_telegram_send_now(argument)
+        else:
+            await self.notifier.send("Неизвестная команда. Напишите /help.")
+
+    def telegram_help_text(self) -> str:
+        return (
+            "Команды админа:\n\n"
+            "/next_events - показать 5 ближайших событий\n"
+            "/next_events 10 - показать до 10 событий\n"
+            "/send_now - отправить все сообщения сейчас\n"
+            "/send_now weekly_25x25_common_monday - отправить одно событие\n"
+            "/help - показать эту подсказку"
+        )
+
+    async def handle_telegram_next_events(self, argument: str) -> None:
+        limit = 5
+        if argument:
+            try:
+                limit = int(argument)
+            except ValueError:
+                await self.notifier.send("Лимит должен быть числом, например: /next_events 10")
+                return
+
+        limit = max(1, min(limit, 10))
+        await self.notifier.send(self.format_next_events(limit=limit))
+
+    async def handle_telegram_send_now(self, event_name: str) -> None:
+        selected_events = self.find_events(event_name)
+        if not selected_events:
+            await self.notifier.send(
+                "Событие не найдено.\n\n"
+                f"Доступные имена:\n{self.format_event_names()}"
+            )
+            return
+
+        await self.notifier.send(
+            "Запускаю ручную отправку...\n\n"
+            f"Событий к отправке: {len(selected_events)}"
+        )
+
+        sent_count = 0
+        for event in selected_events:
+            if await self.send_scheduled_message(event):
+                sent_count += 1
+
+        await self.notifier.send(
+            "Ручная отправка завершена\n\n"
+            f"Отправлено: {sent_count} из {len(selected_events)}"
+        )
+
+    def find_events(self, event_name: str) -> list[ScheduledEvent]:
+        if not event_name:
+            return self.events
+        return [event for event in self.events if event.name == event_name]
+
+    def format_event_names(self) -> str:
+        return "\n".join(f"• {event.name}" for event in self.events)
 
     def get_next_runs(self) -> list[tuple[ScheduledEvent, datetime]]:
         next_runs: list[tuple[ScheduledEvent, datetime]] = []
@@ -374,10 +535,13 @@ class ScheduledDiscordBot(discord.Client):
     async def notify_started(self) -> None:
         user = f"{self.user}" if self.user else "неизвестно"
         await self.notifier.send(
-            "✅ Бот запущен\n\n"
+            "Бот запущен\n\n"
             f"Аккаунт: {user}\n"
             f"Событий в расписании: {len(self.events)}\n\n"
-            f"{self.format_next_events(limit=5)}"
+            f"{self.format_next_events(limit=5)}\n\n"
+            "Telegram-команды:\n"
+            "/next_events\n"
+            "/send_now"
         )
 
     async def send_scheduled_message(self, event: ScheduledEvent) -> bool:
@@ -390,7 +554,7 @@ class ScheduledDiscordBot(discord.Client):
             if not callable(send):
                 logger.error("Channel %s for event %s is not messageable", event.channel_id, event.name)
                 await self.notifier.send(
-                    "❌ Ошибка отправки сообщения\n\n"
+                    "Ошибка отправки сообщения\n\n"
                     f"Событие: {event.name}\n"
                     f"Канал: {event.channel_id}\n"
                     f"Текст: {event.text}\n\n"
@@ -408,7 +572,7 @@ class ScheduledDiscordBot(discord.Client):
             except discord.Forbidden:
                 logger.exception("Missing Discord permissions to add reaction for event %s", event.name)
                 await self.notifier.send(
-                    "⚠️ Сообщение отправлено, но реакция не поставилась\n\n"
+                    "Сообщение отправлено, но реакция не поставилась\n\n"
                     f"Событие: {event.name}\n"
                     f"Канал: {event.channel_id}\n"
                     f"Реакция: {event.reaction}\n\n"
@@ -418,7 +582,7 @@ class ScheduledDiscordBot(discord.Client):
             except discord.HTTPException as exc:
                 logger.exception("Discord API error while adding reaction for event %s", event.name)
                 await self.notifier.send(
-                    "⚠️ Сообщение отправлено, но реакция не поставилась\n\n"
+                    "Сообщение отправлено, но реакция не поставилась\n\n"
                     f"Событие: {event.name}\n"
                     f"Канал: {event.channel_id}\n"
                     f"Реакция: {event.reaction}\n\n"
@@ -431,7 +595,7 @@ class ScheduledDiscordBot(discord.Client):
         except discord.Forbidden as exc:
             logger.exception("Missing Discord permissions for event %s", event.name)
             await self.notifier.send(
-                "❌ Ошибка отправки сообщения\n\n"
+                "Ошибка отправки сообщения\n\n"
                 f"Событие: {event.name}\n"
                 f"Канал: {event.channel_id}\n"
                 f"Текст: {event.text}\n\n"
@@ -440,7 +604,7 @@ class ScheduledDiscordBot(discord.Client):
         except discord.HTTPException as exc:
             logger.exception("Discord API error while sending event %s", event.name)
             await self.notifier.send(
-                "❌ Ошибка отправки сообщения\n\n"
+                "Ошибка отправки сообщения\n\n"
                 f"Событие: {event.name}\n"
                 f"Канал: {event.channel_id}\n"
                 f"Текст: {event.text}\n\n"
@@ -449,7 +613,7 @@ class ScheduledDiscordBot(discord.Client):
         except Exception as exc:
             logger.exception("Unexpected error while sending event %s", event.name)
             await self.notifier.send(
-                "❌ Неожиданная ошибка отправки сообщения\n\n"
+                "Неожиданная ошибка отправки сообщения\n\n"
                 f"Событие: {event.name}\n"
                 f"Канал: {event.channel_id}\n"
                 f"Текст: {event.text}\n\n"
@@ -457,7 +621,7 @@ class ScheduledDiscordBot(discord.Client):
             )
         return False
 
-    async def send_now_command(self, interaction: discord.Interaction, event_name: str = "") -> None:
+    async def discord_send_now_command(self, interaction: discord.Interaction, event_name: str = "") -> None:
         if not self.can_use_manual_command(interaction):
             await interaction.response.send_message(
                 "Эта команда доступна только администраторам или пользователям с правом Manage Server.",
@@ -465,14 +629,10 @@ class ScheduledDiscordBot(discord.Client):
             )
             return
 
-        selected_events = self.events
-        if event_name:
-            selected_events = [event for event in self.events if event.name == event_name]
-
+        selected_events = self.find_events(event_name)
         if not selected_events:
-            available = ", ".join(event.name for event in self.events)
             await interaction.response.send_message(
-                f"Событие не найдено. Доступные имена: {available}",
+                f"Событие не найдено. Доступные имена: {', '.join(event.name for event in self.events)}",
                 ephemeral=True,
             )
             return
@@ -488,13 +648,8 @@ class ScheduledDiscordBot(discord.Client):
             f"Готово: отправлено {sent_count} из {len(selected_events)} сообщений.",
             ephemeral=True,
         )
-        await self.notifier.send(
-            "ℹ️ Ручная отправка через /send_now\n\n"
-            f"Пользователь: {interaction.user}\n"
-            f"Событий отправлено: {sent_count} из {len(selected_events)}"
-        )
 
-    async def next_events_command(self, interaction: discord.Interaction, limit: int = 5) -> None:
+    async def discord_next_events_command(self, interaction: discord.Interaction, limit: int = 5) -> None:
         if not self.can_use_manual_command(interaction):
             await interaction.response.send_message(
                 "Эта команда доступна только администраторам или пользователям с правом Manage Server.",

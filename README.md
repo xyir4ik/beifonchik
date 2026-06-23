@@ -4,8 +4,8 @@
 
 Дополнительно есть:
 
-- slash-команда `/send_now` для ручной отправки сообщений;
-- slash-команда `/next_events` для просмотра ближайших событий;
+- Telegram-команда `/send_now` для ручной отправки сообщений в Discord;
+- Telegram-команда `/next_events` для просмотра ближайших событий;
 - Telegram-уведомления на русском о запуске, ошибках и ручных отправках;
 - лог ближайшего времени срабатывания каждого события;
 - защита от случайного запуска двух копий бота;
@@ -27,6 +27,79 @@
 | Четверг | 18:20 | `<@&1199509896069124106> реаки 25x25 общее взх` |
 | Воскресенье | 18:20 | `<@&1199509896069124106> реаки 25x25 взх мафий` |
 
+## Telegram-команды
+
+Команды пишутся вашему Telegram-боту, который указан в `TELEGRAM_BOT_TOKEN`.
+
+Доступ разрешен только чату из переменной `TELEGRAM_CHAT_ID`.
+
+```text
+/next_events
+```
+
+Показывает 5 ближайших событий.
+
+```text
+/next_events 10
+```
+
+Показывает до 10 ближайших событий.
+
+```text
+/send_now
+```
+
+Сразу отправляет все сообщения из `events.json` в Discord.
+
+```text
+/send_now weekly_25x25_common_monday
+```
+
+Отправляет одно событие по имени.
+
+```text
+/help
+```
+
+Показывает список Telegram-команд.
+
+## Telegram-уведомления
+
+Чтобы включить уведомления и команды:
+
+1. Откройте Telegram и напишите `@BotFather`.
+2. Создайте бота командой `/newbot`.
+3. Скопируйте токен Telegram-бота.
+4. Напишите любое сообщение созданному Telegram-боту.
+5. Узнайте свой `chat_id`, например через `@userinfobot` или через запрос:
+
+```text
+https://api.telegram.org/botTELEGRAM_BOT_TOKEN/getUpdates
+```
+
+На BotHost добавьте:
+
+```env
+TELEGRAM_BOT_TOKEN=токен_telegram_бота
+TELEGRAM_CHAT_ID=ваш_chat_id
+```
+
+При запуске придет сообщение:
+
+```text
+Бот запущен
+
+Аккаунт: бейфончик#0638
+Событий в расписании: 5
+
+Ближайшие события:
+• weekly_25x25_common_thursday — 25.06.2026 18:20 МСК
+
+Telegram-команды:
+/next_events
+/send_now
+```
+
 ## Конфиг событий
 
 События лежат в `events.json`:
@@ -47,104 +120,14 @@
 }
 ```
 
-`channel_id`, `role_id`, `reaction` и `allowed_mentions` применяются ко всем событиям. В каждом событии достаточно указать:
-
-- `name` - уникальное имя события;
-- `text` - текст без роли, бот сам добавит `<@&role_id>`;
-- `cron` - расписание в формате `минута час день_месяца месяц день_недели`.
-
-## Slash-команда
-
-Бот регистрирует команды:
-
-```text
-/send_now
-/next_events
-```
-
-`/send_now` без параметров отправит все сообщения из `events.json` сразу.
-
-Можно отправить одно событие по имени:
-
-```text
-/send_now event_name: weekly_25x25_common_monday
-```
-
-`/next_events` покажет ближайшие события:
-
-```text
-/next_events
-/next_events limit: 10
-```
-
-Командами могут пользоваться только пользователи с правом `Administrator` или `Manage Server`.
-
-Чтобы slash-команда появилась быстро, добавьте в переменные окружения ID сервера:
-
-```env
-DISCORD_GUILD_ID=ваш_id_сервера
-```
-
-Если `DISCORD_GUILD_ID` не указан, команда синхронизируется глобально и может появиться в Discord не сразу.
-
-## Telegram-уведомления
-
-Telegram-уведомления опциональны. Если переменные не указаны, бот продолжит работать без них.
-
-Чтобы включить уведомления:
-
-1. Откройте Telegram и напишите `@BotFather`.
-2. Создайте бота командой `/newbot`.
-3. Скопируйте токен Telegram-бота.
-4. Напишите любое сообщение созданному Telegram-боту.
-5. Узнайте свой `chat_id`, например через `@userinfobot` или через запрос:
-
-```text
-https://api.telegram.org/botTELEGRAM_BOT_TOKEN/getUpdates
-```
-
-На BotHost добавьте переменные:
-
-```env
-TELEGRAM_BOT_TOKEN=токен_telegram_бота
-TELEGRAM_CHAT_ID=ваш_chat_id
-```
-
-Бот будет присылать уведомления на русском:
-
-```text
-✅ Бот запущен
-
-Аккаунт: бейфончик#0638
-Событий в расписании: 5
-
-Ближайшие события:
-• weekly_25x25_common_thursday — 25.06.2026 18:20 МСК
-```
-
-```text
-❌ Ошибка отправки сообщения
-
-Событие: weekly_25x25_common_thursday
-Канал: 1199512515755909171
-Ошибка: нет прав Discord на отправку сообщения
-```
-
-```text
-⚠️ Сообщение отправлено, но реакция не поставилась
-```
-
-```text
-💥 Бот аварийно завершился
-```
+`channel_id`, `role_id`, `reaction` и `allowed_mentions` применяются ко всем событиям.
 
 ## Права бота в Discord
 
-При добавлении бота на сервер выберите scopes:
+При добавлении бота на сервер выберите scope:
 
 ```text
 bot
-applications.commands
 ```
 
 Права:
@@ -157,52 +140,56 @@ Read Message History
 Mention @everyone, @here, and All Roles
 ```
 
-Если не выдавать право `Mention @everyone, @here, and All Roles`, роль `1199509896069124106` должна быть mentionable в настройках сервера.
+Scope `applications.commands` нужен только если вы специально включаете Discord slash-команды через `ENABLE_DISCORD_COMMANDS=true`.
 
-## Локальный запуск
-
-Перейдите в папку проекта:
-
-```powershell
-cd "C:\Users\godisjoke\Desktop\дсбот"
-```
-
-Создайте `.env`:
-
-```powershell
-Copy-Item .env.example .env
-notepad .env
-```
-
-В `.env` укажите токен бота:
+## Переменные окружения BotHost
 
 ```env
 DISCORD_TOKEN=ваш_токен_бота
 TIMEZONE=Europe/Moscow
 EVENTS_FILE=events.json
 LOG_LEVEL=INFO
-DISCORD_GUILD_ID=
 LOCK_FILE=.bot.lock
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=
+TELEGRAM_BOT_TOKEN=токен_telegram_бота
+TELEGRAM_CHAT_ID=ваш_chat_id
+ENABLE_DISCORD_COMMANDS=false
+DISCORD_GUILD_ID=
 ```
 
-Установите зависимости:
+Для обычной работы `DISCORD_GUILD_ID` можно оставить пустым.
 
-```powershell
-pip install -r requirements.txt
-```
+## Деплой на BotHost
 
-Запустите бота:
+1. Подключите GitHub-репозиторий `xyir4ik/beifonchik`.
+2. Укажите ветку `main`.
+3. Выберите Python `3.11`, если BotHost предлагает версию.
+4. Команда запуска:
 
-```powershell
+```bash
 python main.py
 ```
 
-После запуска в логах появятся ближайшие срабатывания:
+5. Добавьте переменные окружения из раздела выше.
+6. Сохраните настройки и перезапустите бота.
+
+В логах должно быть:
 
 ```text
-Next weekly_25x25_mafia_tuesday: 2026-06-23 18:20 MSK
+Logged in as ...
+Scheduled weekly_15x15_vzp_saturday with cron '10 18 * * sat'
+Next weekly_15x15_vzp_saturday: ... MSK
+Scheduler started
+Telegram commands polling started
+```
+
+## Локальный запуск
+
+```powershell
+cd "C:\Users\godisjoke\Desktop\дсбот"
+Copy-Item .env.example .env
+notepad .env
+pip install -r requirements.txt
+python main.py
 ```
 
 ## Защита от двойного запуска
@@ -212,93 +199,6 @@ Next weekly_25x25_mafia_tuesday: 2026-06-23 18:20 MSK
 ```text
 Another bot process is already running
 ```
-
-Это нужно, чтобы две копии бота не отправили одинаковые сообщения одновременно.
-
-## Загрузка на GitHub
-
-Репозиторий: `https://github.com/xyir4ik/beifonchik.git`
-
-Команды из папки проекта:
-
-```powershell
-cd "C:\Users\godisjoke\Desktop\дсбот"
-git init
-git add .
-git commit -m "Update scheduled Discord bot"
-git branch -M main
-git remote add origin https://github.com/xyir4ik/beifonchik.git
-git push -u origin main
-```
-
-Если remote уже существует:
-
-```powershell
-git remote set-url origin https://github.com/xyir4ik/beifonchik.git
-git push -u origin main
-```
-
-Файл `.env` не попадет в GitHub, потому что он добавлен в `.gitignore`. Токен бота нельзя коммитить в репозиторий.
-
-## Деплой на BotHost
-
-Dockerfile для этого бота не нужен. Проект обычный Python-проект: зависимости описаны в `requirements.txt`, запуск идет через `python main.py`.
-
-На BotHost сделайте так:
-
-1. Создайте новый проект/бот.
-2. Подключите GitHub-репозиторий `xyir4ik/beifonchik`.
-3. Укажите ветку `main`.
-4. Выберите Python `3.11`, если BotHost предлагает версию.
-5. Укажите команду запуска:
-
-```bash
-python main.py
-```
-
-6. Добавьте переменные окружения:
-
-```env
-DISCORD_TOKEN=ваш_токен_бота
-TIMEZONE=Europe/Moscow
-EVENTS_FILE=events.json
-LOG_LEVEL=INFO
-DISCORD_GUILD_ID=ваш_id_сервера
-LOCK_FILE=.bot.lock
-TELEGRAM_BOT_TOKEN=токен_telegram_бота
-TELEGRAM_CHAT_ID=ваш_chat_id
-```
-
-7. Сохраните настройки и запустите/перезапустите бота.
-
-В логах после запуска должно появиться:
-
-```text
-Logged in as ...
-Synced 2 slash command(s) to guild ...
-Scheduled weekly_15x15_vzp_saturday with cron '10 18 * * sat'
-Next weekly_15x15_vzp_saturday: ... MSK
-Scheduler started
-```
-
-## Если slash-команда не появилась
-
-Проверьте:
-
-- бот был приглашен со scope `applications.commands`;
-- в BotHost указан правильный `DISCORD_GUILD_ID`;
-- бот был перезапущен после изменения переменных окружения;
-- у вашего пользователя есть право `Administrator` или `Manage Server`.
-
-Если в логах есть ошибка:
-
-```text
-403 Forbidden (error code: 50001): Missing Access
-```
-
-значит Discord не дал боту зарегистрировать slash-команды на указанном сервере. Обычно причина в том, что в `DISCORD_GUILD_ID` указан ID канала/роли вместо ID сервера, или бот был приглашен без scope `applications.commands`.
-
-Расписание при такой ошибке продолжит работать. Не будут работать только slash-команды `/send_now` и `/next_events`, пока не исправить доступ.
 
 ## Python
 
