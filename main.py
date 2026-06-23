@@ -256,8 +256,8 @@ def read_config() -> BotConfig:
         events=read_events(),
         timezone=ZoneInfo(timezone_name),
         guild_id=guild_id,
-        telegram_bot_token=get_env_first("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN"),
-        telegram_chat_id=get_env_first("TELEGRAM_CHAT_ID", "TG_CHAT_ID"),
+        telegram_bot_token=get_env_first("TG_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"),
+        telegram_chat_id=get_env_first("TG_CHAT_ID", "TELEGRAM_CHAT_ID"),
         enable_discord_commands=parse_bool(os.getenv("ENABLE_DISCORD_COMMANDS"), default=False),
     )
 
@@ -282,8 +282,8 @@ def build_allowed_mentions(mode: str) -> discord.AllowedMentions:
 
 def build_notifier_from_env() -> TelegramNotifier:
     return TelegramNotifier(
-        bot_token=get_env_first("TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN"),
-        chat_id=get_env_first("TELEGRAM_CHAT_ID", "TG_CHAT_ID"),
+        bot_token=get_env_first("TG_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"),
+        chat_id=get_env_first("TG_CHAT_ID", "TELEGRAM_CHAT_ID"),
     )
 
 
@@ -398,7 +398,7 @@ class ScheduledDiscordBot(discord.Client):
     def start_telegram_commands(self) -> None:
         if not self.notifier.enabled:
             logger.info(
-                "Telegram commands are disabled because TELEGRAM_BOT_TOKEN/TG_BOT_TOKEN or TELEGRAM_CHAT_ID/TG_CHAT_ID is not set"
+                "Telegram commands are disabled because TG_BOT_TOKEN/TELEGRAM_BOT_TOKEN or TG_CHAT_ID/TELEGRAM_CHAT_ID is not set"
             )
             return
         if self._telegram_task and not self._telegram_task.done():

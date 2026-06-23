@@ -29,9 +29,9 @@
 
 ## Telegram-команды
 
-Команды пишутся вашему Telegram-боту, который указан в `TELEGRAM_BOT_TOKEN` или `TG_BOT_TOKEN`.
+Команды пишутся вашему Telegram-боту, который указан в `TG_BOT_TOKEN`.
 
-Доступ разрешен только чату из переменной `TELEGRAM_CHAT_ID` или `TG_CHAT_ID`.
+Доступ разрешен только чату из переменной `TG_CHAT_ID`.
 
 ```text
 /next_events
@@ -77,30 +77,32 @@
 https://api.telegram.org/botTELEGRAM_BOT_TOKEN/getUpdates
 ```
 
-На BotHost добавьте:
-
-```env
-TELEGRAM_BOT_TOKEN=токен_telegram_бота
-TELEGRAM_CHAT_ID=ваш_chat_id
-```
-
-Если BotHost не сохраняет переменную `TELEGRAM_BOT_TOKEN`, используйте короткие имена:
+На BotHost добавьте именно короткие переменные:
 
 ```env
 TG_BOT_TOKEN=токен_telegram_бота
 TG_CHAT_ID=ваш_chat_id
 ```
 
-`TELEGRAM_BOT_TOKEN` вставляется без слова `bot` в начале. Правильно:
+BotHost может иметь системную переменную `TELEGRAM_BOT_TOKEN`, поэтому для этого проекта лучше использовать `TG_BOT_TOKEN`.
+
+Код сначала читает `TG_BOT_TOKEN` и `TG_CHAT_ID`. Переменные `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID` используются только как запасной вариант.
 
 ```env
-TELEGRAM_BOT_TOKEN=1234567890:AA...
+TG_BOT_TOKEN=токен_telegram_бота
+TG_CHAT_ID=ваш_chat_id
+```
+
+`TG_BOT_TOKEN` вставляется без слова `bot` в начале. Правильно:
+
+```env
+TG_BOT_TOKEN=1234567890:AA...
 ```
 
 Неправильно:
 
 ```env
-TELEGRAM_BOT_TOKEN=bot1234567890:AA...
+TG_BOT_TOKEN=bot1234567890:AA...
 ```
 
 При запуске придет сообщение:
@@ -125,7 +127,7 @@ Telegram-команды:
 Telegram API getUpdates failed: HTTP 404 {'ok': False, 'error_code': 404, 'description': 'Not Found'}
 ```
 
-значит Telegram не нашел бота по токену. Проверьте `TELEGRAM_BOT_TOKEN` или `TG_BOT_TOKEN`: он должен быть токеном от `@BotFather`, без лишних пробелов, кавычек и без слова `bot` в начале.
+значит Telegram не нашел бота по токену. Проверьте `TG_BOT_TOKEN`: он должен быть токеном от `@BotFather`, без лишних пробелов, кавычек и без слова `bot` в начале.
 
 ## Конфиг событий
 
@@ -177,10 +179,8 @@ TIMEZONE=Europe/Moscow
 EVENTS_FILE=events.json
 LOG_LEVEL=INFO
 LOCK_FILE=.bot.lock
-TELEGRAM_BOT_TOKEN=токен_telegram_бота
-TELEGRAM_CHAT_ID=ваш_chat_id
-TG_BOT_TOKEN=
-TG_CHAT_ID=
+TG_BOT_TOKEN=токен_telegram_бота
+TG_CHAT_ID=ваш_chat_id
 ENABLE_DISCORD_COMMANDS=false
 DISCORD_GUILD_ID=
 ```
