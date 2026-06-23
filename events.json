@@ -1,42 +1,33 @@
-[
-  {
-    "name": "weekly_15x15_vzp_saturday",
-    "channel_id": 1199512515755909171,
-    "text": "<@&1199509896069124106> реаки 15x15 ВЗП",
-    "reaction": "✅",
-    "cron": "10 18 * * sat",
-    "allowed_mentions": "roles"
-  },
-  {
-    "name": "weekly_25x25_common_monday",
-    "channel_id": 1199512515755909171,
-    "text": "<@&1199509896069124106> реаки 25x25 общее взх",
-    "reaction": "✅",
-    "cron": "20 18 * * mon",
-    "allowed_mentions": "roles"
-  },
-  {
-    "name": "weekly_25x25_mafia_tuesday",
-    "channel_id": 1199512515755909171,
-    "text": "<@&1199509896069124106> реаки 25x25 взх мафий",
-    "reaction": "✅",
-    "cron": "20 18 * * tue",
-    "allowed_mentions": "roles"
-  },
-  {
-    "name": "weekly_25x25_common_thursday",
-    "channel_id": 1199512515755909171,
-    "text": "<@&1199509896069124106> реаки 25x25 общее взх",
-    "reaction": "✅",
-    "cron": "20 18 * * thu",
-    "allowed_mentions": "roles"
-  },
-  {
-    "name": "weekly_25x25_mafia_sunday",
-    "channel_id": 1199512515755909171,
-    "text": "<@&1199509896069124106> реаки 25x25 взх мафий",
-    "reaction": "✅",
-    "cron": "20 18 * * sun",
-    "allowed_mentions": "roles"
-  }
-]
+{
+  "channel_id": 1199512515755909171,
+  "role_id": 1199509896069124106,
+  "reaction": "✅",
+  "allowed_mentions": "roles",
+  "events": [
+    {
+      "name": "weekly_15x15_vzp_saturday",
+      "text": "реаки 15x15 ВЗП",
+      "cron": "10 18 * * sat"
+    },
+    {
+      "name": "weekly_25x25_common_monday",
+      "text": "реаки 25x25 общее взх",
+      "cron": "20 18 * * mon"
+    },
+    {
+      "name": "weekly_25x25_mafia_tuesday",
+      "text": "реаки 25x25 взх мафий",
+      "cron": "20 18 * * tue"
+    },
+    {
+      "name": "weekly_25x25_common_thursday",
+      "text": "реаки 25x25 общее взх",
+      "cron": "20 18 * * thu"
+    },
+    {
+      "name": "weekly_25x25_mafia_sunday",
+      "text": "реаки 25x25 взх мафий",
+      "cron": "20 18 * * sun"
+    }
+  ]
+}
