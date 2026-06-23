@@ -25,6 +25,8 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 logger = logging.getLogger("scheduled-discord-bot")
+TEST_ROLE_ID = 1203431256419995668
+TEST_CALLBACK_PREFIX = "test_event:"
 
 
 def get_env_first(*names: str) -> str | None:
@@ -86,14 +88,40 @@ class TelegramNotifier:
 
         await self.send_to_chat(self.chat_id, text)
 
-    async def send_to_chat(self, chat_id: str | int, text: str) -> None:
+    async def send_to_chat(
+        self,
+        chat_id: str | int,
+        text: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> None:
         if not self.bot_token:
             return
 
+        payload: dict[str, Any] = {
+            "chat_id": str(chat_id),
+            "text": text[:3900],
+            "disable_web_page_preview": True,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+
+        await self.api_request("sendMessage", payload)
+
+    async def answer_callback_query(self, callback_query_id: str, text: str) -> None:
         await self.api_request(
-            "sendMessage",
+            "answerCallbackQuery",
+            {
+                "callback_query_id": callback_query_id,
+                "text": text[:200],
+            },
+        )
+
+    async def edit_message_text(self, chat_id: str | int, message_id: int, text: str) -> None:
+        await self.api_request(
+            "editMessageText",
             {
                 "chat_id": str(chat_id),
+                "message_id": message_id,
                 "text": text[:3900],
                 "disable_web_page_preview": True,
             },
@@ -105,7 +133,7 @@ class TelegramNotifier:
 
         payload: dict[str, Any] = {
             "timeout": timeout_seconds,
-            "allowed_updates": ["message"],
+            "allowed_updates": ["message", "callback_query"],
         }
         if offset is not None:
             payload["offset"] = offset
@@ -441,6 +469,11 @@ class ScheduledDiscordBot(discord.Client):
         return max(update_ids) + 1
 
     async def handle_telegram_update(self, update: dict[str, Any]) -> None:
+        callback_query = update.get("callback_query")
+        if isinstance(callback_query, dict):
+            await self.handle_telegram_callback(callback_query)
+            return
+
         message = update.get("message")
         if not isinstance(message, dict):
             return
@@ -468,6 +501,8 @@ class ScheduledDiscordBot(discord.Client):
             await self.handle_telegram_next_events(argument)
         elif command == "/send_now":
             await self.handle_telegram_send_now(argument)
+        elif command == "/test":
+            await self.handle_telegram_test()
         else:
             await self.notifier.send("Неизвестная команда. Напишите /help.")
 
@@ -478,7 +513,78 @@ class ScheduledDiscordBot(discord.Client):
             "/next_events 10 - показать до 10 событий\n"
             "/send_now - отправить все сообщения сейчас\n"
             "/send_now weekly_25x25_common_monday - отправить одно событие\n"
+            "/test - выбрать тестовое событие кнопкой\n"
             "/help - показать эту подсказку"
+        )
+
+    async def handle_telegram_test(self) -> None:
+        keyboard = []
+        for index, event in enumerate(self.events):
+            keyboard.append(
+                [
+                    {
+                        "text": event.name,
+                        "callback_data": f"{TEST_CALLBACK_PREFIX}{index}",
+                    }
+                ]
+            )
+
+        await self.notifier.send_to_chat(
+            self.notifier.chat_id or "",
+            "Выберите тестовое уведомление для отправки в Discord.\n\n"
+            f"В тесте будет тегаться роль: {TEST_ROLE_ID}",
+            reply_markup={"inline_keyboard": keyboard},
+        )
+
+    async def handle_telegram_callback(self, callback_query: dict[str, Any]) -> None:
+        callback_query_id = str(callback_query.get("id") or "")
+        data = str(callback_query.get("data") or "")
+
+        message = callback_query.get("message")
+        if not isinstance(message, dict):
+            return
+
+        chat = message.get("chat")
+        if not isinstance(chat, dict):
+            return
+
+        chat_id = str(chat.get("id"))
+        if chat_id != self.notifier.chat_id:
+            logger.warning("Ignoring Telegram callback from unauthorized chat_id=%s", chat_id)
+            if callback_query_id:
+                await self.notifier.answer_callback_query(callback_query_id, "Нет доступа")
+            return
+
+        if not data.startswith(TEST_CALLBACK_PREFIX):
+            return
+
+        try:
+            event_index = int(data.removeprefix(TEST_CALLBACK_PREFIX))
+            event = self.events[event_index]
+        except (ValueError, IndexError):
+            if callback_query_id:
+                await self.notifier.answer_callback_query(callback_query_id, "Событие не найдено")
+            return
+
+        if callback_query_id:
+            await self.notifier.answer_callback_query(callback_query_id, "Отправляю тест")
+
+        message_id = message.get("message_id")
+        if isinstance(message_id, int):
+            await self.notifier.edit_message_text(
+                chat_id,
+                message_id,
+                f"Выбрано тестовое событие:\n{event.name}\n\nОтправляю в Discord...",
+            )
+
+        test_event = self.with_role_override(event, TEST_ROLE_ID)
+        sent = await self.send_scheduled_message(test_event)
+
+        result_text = "Тестовое уведомление отправлено" if sent else "Тестовое уведомление не отправилось"
+        await self.notifier.send(
+            f"{result_text}\n\n"
+            f"Событие: {event.name}\n"
+            f"Тестовая роль: {TEST_ROLE_ID}"
         )
 
     async def handle_telegram_next_events(self, argument: str) -> None:
@@ -522,6 +628,24 @@ class ScheduledDiscordBot(discord.Client):
             return self.events
         return [event for event in self.events if event.name == event_name]
 
+    @staticmethod
+    def with_role_override(event: ScheduledEvent, role_id: int) -> ScheduledEvent:
+        text = event.text
+        parts = text.split(">", 1)
+        if len(parts) == 2 and parts[0].startswith("<@&"):
+            text = f"<@&{role_id}>{parts[1]}"
+        else:
+            text = f"<@&{role_id}> {text}"
+
+        return ScheduledEvent(
+            name=f"test_{event.name}",
+            channel_id=event.channel_id,
+            text=text,
+            reaction=event.reaction,
+            cron=event.cron,
+            allowed_mentions=event.allowed_mentions,
+        )
+
     def format_event_names(self) -> str:
         return "\n".join(f"• {event.name}" for event in self.events)
 
@@ -564,7 +688,8 @@ class ScheduledDiscordBot(discord.Client):
             f"{self.format_next_events(limit=5)}\n\n"
             "Telegram-команды:\n"
             "/next_events\n"
-            "/send_now"
+            "/send_now\n"
+            "/test"
         )
 
     async def send_scheduled_message(self, event: ScheduledEvent) -> bool:
