@@ -246,16 +246,23 @@ class ScheduledDiscordBot(discord.Client):
         if self._commands_synced:
             return
 
-        if self.guild_id is not None:
-            guild = discord.Object(id=self.guild_id)
-            self.tree.copy_global_to(guild=guild)
-            synced = await self.tree.sync(guild=guild)
-            logger.info("Synced %s slash command(s) to guild %s", len(synced), self.guild_id)
-        else:
-            synced = await self.tree.sync()
-            logger.info("Synced %s global slash command(s)", len(synced))
-
-        self._commands_synced = True
+        try:
+            if self.guild_id is not None:
+                guild = discord.Object(id=self.guild_id)
+                self.tree.copy_global_to(guild=guild)
+                synced = await self.tree.sync(guild=guild)
+                logger.info("Synced %s slash command(s) to guild %s", len(synced), self.guild_id)
+            else:
+                synced = await self.tree.sync()
+                logger.info("Synced %s global slash command(s)", len(synced))
+        except discord.Forbidden:
+            logger.exception(
+                "Could not sync slash commands. Check DISCORD_GUILD_ID and invite the bot with applications.commands scope. Scheduled messages will still run."
+            )
+        except discord.HTTPException:
+            logger.exception("Discord API error while syncing slash commands. Scheduled messages will still run.")
+        finally:
+            self._commands_synced = True
 
     def log_next_runs(self) -> None:
         for event in self.events:
