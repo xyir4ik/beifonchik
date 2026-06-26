@@ -142,6 +142,37 @@ class EventStore:
         )
         self.save()
 
+    def update_event_field(self, index: int, field: str, value: str) -> None:
+        if field not in {"name", "text", "cron"}:
+            raise ValueError("Можно изменить только название, текст или расписание")
+
+        events = self.events_raw()
+        if index < 0 or index >= len(events):
+            raise IndexError("Событие не найдено")
+
+        event = events[index]
+        if not isinstance(event, dict):
+            raise ValueError("Событие повреждено")
+
+        value = value.strip()
+        if not value:
+            raise ValueError("Значение не может быть пустым")
+
+        if field == "name":
+            if any(
+                item_index != index
+                and isinstance(item, dict)
+                and str(item.get("name")) == value
+                for item_index, item in enumerate(events)
+            ):
+                raise ValueError(f"Событие с именем {value} уже существует")
+        elif field == "cron":
+            self.validate_cron(value)
+
+        event[field] = value
+        self.parse_events(self.data)
+        self.save()
+
     @staticmethod
     def validate_cron(cron: str) -> None:
         CronTrigger.from_crontab(cron)

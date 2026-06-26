@@ -108,6 +108,9 @@ class ScheduleService:
     def add_event(self, name: str, cron: str, text: str) -> None:
         self.event_store.add_event(name=name, cron=cron, text=text)
 
+    def update_event_field(self, index: int, field: str, value: str) -> None:
+        self.event_store.update_event_field(index=index, field=field, value=value)
+
     async def send_events_manually(self, events: list[ScheduledEvent]) -> None:
         await self.notifier.send(
             "Запускаю ручную отправку...\n\n"

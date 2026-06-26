@@ -5,6 +5,7 @@ from typing import Any
 
 from constants import TEST_ROLE_ID
 from formatting import EventFormatter
+from models import ScheduledEvent
 from schedule_service import ScheduleService
 from telegram_client import TelegramNotifier
 
@@ -95,8 +96,13 @@ class TelegramAdminBot:
             return
 
         pending_action = self.pending_actions.get(chat_id)
-        if pending_action and pending_action.startswith("add_event:") and not text.startswith("/"):
-            await self.handle_add_event_input(chat_id, text)
+        if pending_action and not text.startswith("/"):
+            if pending_action.startswith("add_event:"):
+                await self.handle_add_event_input(chat_id, text)
+                return
+            if pending_action.startswith("edit_event:"):
+                await self.handle_edit_event_input(chat_id, text)
+                return
             return
 
         if not text.startswith("/"):
@@ -257,6 +263,44 @@ class TelegramAdminBot:
                     reply_markup=self.back_keyboard(),
                 )
 
+    async def handle_edit_event_input(self, chat_id: str, text: str) -> None:
+        step = self.pending_actions.get(chat_id)
+        if not step:
+            return
+
+        _, raw_index, field = step.split(":", 2)
+        try:
+            index = int(raw_index)
+        except ValueError:
+            self.clear_pending(chat_id)
+            await self.notifier.send("Событие не найдено. Откройте меню заново.", reply_markup=self.schedule_menu_keyboard())
+            return
+
+        event = self.schedule.event_at(index)
+        if event is None:
+            self.clear_pending(chat_id)
+            await self.notifier.send("Событие не найдено. Откройте меню заново.", reply_markup=self.schedule_menu_keyboard())
+            return
+
+        try:
+            self.schedule.update_event_field(index=index, field=field, value=text)
+            await self.schedule.reload_events()
+            updated = self.schedule.events[index]
+            self.clear_pending(chat_id)
+            await self.notifier.send(
+                "Событие изменено:\n"
+                f"{self.formatter.event_line(updated)}",
+                reply_markup=self.edit_field_keyboard(index),
+            )
+        except Exception as exc:
+            logger.exception("Could not edit event")
+            await self.notifier.send(
+                "Не удалось изменить событие.\n\n"
+                f"Ошибка: {type(exc).__name__}: {exc}\n\n"
+                "Введите значение еще раз или нажмите Назад.",
+                reply_markup=self.back_to_edit_keyboard(index),
+            )
+
     async def handle_callback(self, callback_query: dict[str, Any]) -> None:
         callback_query_id = str(callback_query.get("id") or "")
         data = str(callback_query.get("data") or "")
@@ -286,6 +330,8 @@ class TelegramAdminBot:
             await self.edit_callback_message(message, self.formatter.events_list(self.schedule.events), self.back_keyboard())
         elif data == "menu:toggle":
             await self.edit_callback_message(message, "Выберите событие для включения/отключения:", self.event_keyboard("toggle"))
+        elif data == "menu:edit":
+            await self.edit_callback_message(message, "Выберите событие для изменения:", self.event_keyboard("edit"))
         elif data == "menu:delete":
             await self.edit_callback_message(message, "Выберите событие для удаления:", self.event_keyboard("delete"))
         elif data == "menu:add":
@@ -303,6 +349,10 @@ class TelegramAdminBot:
             await self.handle_reload()
         elif data.startswith("toggle:"):
             await self.handle_toggle_callback(message, data)
+        elif data.startswith("edit_field:"):
+            await self.handle_edit_field_callback(message, chat_id, data)
+        elif data.startswith("edit:"):
+            await self.handle_edit_callback(message, data)
         elif data.startswith("delete:"):
             await self.handle_delete_callback(message, data)
         elif data.startswith("confirm_delete:"):
@@ -339,6 +389,38 @@ class TelegramAdminBot:
             message,
             f"Событие обновлено:\n{self.formatter.event_line(updated)}",
             self.event_keyboard("toggle"),
+        )
+
+    async def handle_edit_callback(self, message: dict[str, Any], data: str) -> None:
+        index = self.callback_index(data)
+        event = self.schedule.event_at(index)
+        if index is None or event is None:
+            await self.edit_callback_message(message, "Событие не найдено. Откройте меню заново.", self.schedule_menu_keyboard())
+            return
+        await self.edit_callback_message(
+            message,
+            "Что изменить?\n\n"
+            f"{self.formatter.event_line(event)}",
+            self.edit_field_keyboard(index),
+        )
+
+    async def handle_edit_field_callback(self, message: dict[str, Any], chat_id: str, data: str) -> None:
+        parsed = self.edit_field_callback_data(data)
+        if parsed is None:
+            await self.edit_callback_message(message, "Событие не найдено. Откройте меню заново.", self.schedule_menu_keyboard())
+            return
+
+        index, field = parsed
+        event = self.schedule.event_at(index)
+        if event is None:
+            await self.edit_callback_message(message, "Событие не найдено. Откройте меню заново.", self.schedule_menu_keyboard())
+            return
+
+        self.pending_actions[chat_id] = f"edit_event:{index}:{field}"
+        await self.edit_callback_message(
+            message,
+            self.edit_prompt(event, field),
+            self.back_to_edit_keyboard(index),
         )
 
     async def handle_delete_callback(self, message: dict[str, Any], data: str) -> None:
@@ -413,6 +495,7 @@ class TelegramAdminBot:
             "inline_keyboard": [
                 [{"text": "Список событий", "callback_data": "menu:list"}],
                 [{"text": "Добавить событие", "callback_data": "menu:add"}],
+                [{"text": "Изменить событие", "callback_data": "menu:edit"}],
                 [{"text": "Включить/отключить", "callback_data": "menu:toggle"}],
                 [{"text": "Удалить событие", "callback_data": "menu:delete"}],
                 [{"text": "Перечитать events.json", "callback_data": "menu:reload"}],
@@ -431,6 +514,54 @@ class TelegramAdminBot:
             keyboard.append([{"text": self.formatter.button_label(event), "callback_data": f"{action}:{index}"}])
         keyboard.append([{"text": "Назад", "callback_data": "menu:main"}])
         return {"inline_keyboard": keyboard}
+
+    @staticmethod
+    def edit_field_keyboard(index: int) -> dict[str, Any]:
+        return {
+            "inline_keyboard": [
+                [{"text": "Название", "callback_data": f"edit_field:{index}:name"}],
+                [{"text": "Текст", "callback_data": f"edit_field:{index}:text"}],
+                [{"text": "Расписание", "callback_data": f"edit_field:{index}:cron"}],
+                [{"text": "Назад", "callback_data": "menu:edit"}],
+            ]
+        }
+
+    @staticmethod
+    def back_to_edit_keyboard(index: int) -> dict[str, Any]:
+        return {"inline_keyboard": [[{"text": "Назад", "callback_data": f"edit:{index}"}]]}
+
+    def edit_prompt(self, event: ScheduledEvent, field: str) -> str:
+        if field == "name":
+            return (
+                "Введите новое название события.\n\n"
+                f"Сейчас:\n{self.formatter.event_display(event)}"
+            )
+        if field == "text":
+            return (
+                "Введите новый текст сообщения.\n\n"
+                "Роль добавится автоматически.\n\n"
+                f"Сейчас:\n{self.formatter.event_display(event)}"
+            )
+        if field == "cron":
+            return (
+                "Введите новое расписание в формате cron.\n\n"
+                "Примеры:\n"
+                "10 18 * * sat — каждую субботу в 18:10\n"
+                "20 18 * * mon — каждый понедельник в 18:20\n\n"
+                "Дни недели: mon, tue, wed, thu, fri, sat, sun\n\n"
+                f"Сейчас:\n{self.formatter.event_display(event)}"
+            )
+        return "Введите новое значение."
+
+    @staticmethod
+    def edit_field_callback_data(data: str) -> tuple[int, str] | None:
+        try:
+            _, raw_index, field = data.split(":", 2)
+            if field not in {"name", "text", "cron"}:
+                return None
+            return int(raw_index), field
+        except ValueError:
+            return None
 
     def is_authorized(
         self,
