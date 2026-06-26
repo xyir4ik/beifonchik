@@ -803,6 +803,7 @@ class ScheduledDiscordBot(discord.Client):
                 "Пример:\n"
                 "weekly_test | 0 19 * * fri | реаки тест\n\n"
                 "Для отмены: /cancel",
+                self.back_keyboard(),
             )
         elif data == "menu:reload":
             await self.handle_reload()
