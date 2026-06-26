@@ -788,7 +788,7 @@ class ScheduledDiscordBot(discord.Client):
         if data == "menu:main":
             await self.edit_callback_message(message, "Управление расписанием", self.schedule_menu_keyboard())
         elif data == "menu:list":
-            await self.edit_callback_message(message, self.format_events_list(), self.schedule_menu_keyboard())
+            await self.edit_callback_message(message, self.format_events_list(), self.back_keyboard())
         elif data == "menu:toggle":
             await self.edit_callback_message(message, "Выберите событие для включения/отключения:", self.event_keyboard("toggle"))
         elif data == "menu:delete":
@@ -938,6 +938,10 @@ class ScheduledDiscordBot(discord.Client):
             ]
         }
 
+    @staticmethod
+    def back_keyboard() -> dict[str, Any]:
+        return {"inline_keyboard": [[{"text": "Назад", "callback_data": "menu:main"}]]}
+
     def event_keyboard(self, action: str) -> dict[str, Any]:
         keyboard = []
         if action == "send":
@@ -947,11 +951,9 @@ class ScheduledDiscordBot(discord.Client):
         keyboard.append([{"text": "Назад", "callback_data": "menu:main"}])
         return {"inline_keyboard": keyboard}
 
-    @staticmethod
-    def button_label(event: ScheduledEvent) -> str:
+    def button_label(self, event: ScheduledEvent) -> str:
         status = "Вкл" if event.enabled else "Выкл"
-        clean_text = event.text.split(">", 1)[1].strip() if event.text.startswith("<@&") and ">" in event.text else event.text
-        return f"{status} | {event.cron} | {clean_text[:28]}"
+        return f"{status} | {self.human_schedule(event)} | {self.clean_event_text(event)[:28]}"
 
     def find_events(self, event_name: str) -> list[ScheduledEvent]:
         if not event_name:
@@ -982,14 +984,58 @@ class ScheduledDiscordBot(discord.Client):
 
     def format_event_line(self, event: ScheduledEvent) -> str:
         status = "включено" if event.enabled else "отключено"
-        return f"{event.name}\nСтатус: {status}\nCron: {event.cron}\nТекст: {event.text}"
+        return (
+            f"{self.human_schedule(event)} — {self.clean_event_text(event)}\n"
+            f"Статус: {status}\n"
+            f"Имя: {event.name}\n"
+            f"Cron: {event.cron}"
+        )
 
     def format_events_list(self) -> str:
         lines = ["События:"]
         for event in self.events:
             status = "вкл" if event.enabled else "выкл"
-            lines.append(f"• {event.name} [{status}] — {event.cron}")
+            lines.append(f"• {self.human_schedule(event)} — {self.clean_event_text(event)} [{status}]")
         return "\n".join(lines)
+
+    @staticmethod
+    def clean_event_text(event: ScheduledEvent) -> str:
+        if event.text.startswith("<@&") and ">" in event.text:
+            return event.text.split(">", 1)[1].strip()
+        return event.text
+
+    @staticmethod
+    def human_schedule(event: ScheduledEvent) -> str:
+        parts = event.cron.split()
+        if len(parts) != 5:
+            return event.cron
+
+        minute, hour, _, _, weekday = parts
+        day_names = {
+            "mon": "Пн",
+            "tue": "Вт",
+            "wed": "Ср",
+            "thu": "Чт",
+            "fri": "Пт",
+            "sat": "Сб",
+            "sun": "Вс",
+            "1": "Пн",
+            "2": "Вт",
+            "3": "Ср",
+            "4": "Чт",
+            "5": "Пт",
+            "6": "Сб",
+            "0": "Вс",
+            "7": "Вс",
+        }
+        day = day_names.get(weekday.lower(), weekday)
+
+        try:
+            time = f"{int(hour):02d}:{int(minute):02d}"
+        except ValueError:
+            time = f"{hour}:{minute}"
+
+        return f"{day} {time}"
 
     def get_next_runs(self) -> list[tuple[ScheduledEvent, datetime]]:
         next_runs: list[tuple[ScheduledEvent, datetime]] = []
