@@ -2,6 +2,7 @@
 .bot.lock
 last_sent.json
 data/
+.data*/
 __pycache__/
 *.py[cod]
 .venv/

@@ -112,7 +112,13 @@ weekly_test | 0 19 * * fri | реаки тест
 
 `enabled: false` отключает событие без удаления.
 
-Важно: изменения, сделанные через Telegram на BotHost, сохраняются в `events.json` текущего контейнера. Если потом заново деплоить проект из GitHub, расписание вернется к версии из репозитория. Для постоянных изменений перенесите их в GitHub.
+На BotHost `events.json` используется как стартовый шаблон. При первом запуске бот создаст рабочий файл расписания:
+
+```text
+$DATA_DIR/schedule.json
+```
+
+Все изменения через Telegram будут сохраняться туда, поэтому обновление кода из GitHub не должно сбрасывать расписание. Если нужно указать свой путь вручную, добавьте переменную `SCHEDULE_FILE`.
 
 ## Переменные Окружения BotHost
 
@@ -120,6 +126,7 @@ weekly_test | 0 19 * * fri | реаки тест
 DISCORD_TOKEN=ваш_токен_discord_бота
 TIMEZONE=Europe/Moscow
 EVENTS_FILE=events.json
+SCHEDULE_FILE=
 LOG_LEVEL=INFO
 LOCK_FILE=.bot.lock
 TG_BOT_TOKEN=токен_telegram_бота

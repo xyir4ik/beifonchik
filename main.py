@@ -374,9 +374,12 @@ class SingleInstanceLock:
 def read_config() -> BotConfig:
     timezone_name = os.getenv("TIMEZONE", "Europe/Moscow")
     guild_id = int(os.getenv("DISCORD_GUILD_ID", "0") or "0") or None
+    raw_events_json = os.getenv("EVENTS_JSON") or None
+    event_store_path = resolve_event_store_path()
+
     event_store = EventStore(
-        path=Path(os.getenv("EVENTS_FILE", "events.json")),
-        raw_events_json=os.getenv("EVENTS_JSON") or None,
+        path=event_store_path,
+        raw_events_json=raw_events_json,
     )
 
     return BotConfig(
@@ -388,6 +391,24 @@ def read_config() -> BotConfig:
         telegram_chat_id=get_env_first("TG_CHAT_ID", "TELEGRAM_CHAT_ID"),
         enable_discord_commands=parse_bool(os.getenv("ENABLE_DISCORD_COMMANDS"), default=False),
     )
+
+
+def resolve_event_store_path() -> Path:
+    schedule_file = os.getenv("SCHEDULE_FILE")
+    seed_file = Path(os.getenv("EVENTS_FILE", "events.json"))
+
+    if schedule_file:
+        target = Path(schedule_file)
+    else:
+        data_dir = os.getenv("DATA_DIR")
+        target = Path(data_dir).joinpath("schedule.json") if data_dir else seed_file
+
+    if target != seed_file and not target.exists():
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(seed_file.read_text(encoding="utf-8"), encoding="utf-8")
+        logger.info("Created persistent schedule file %s from %s", target, seed_file)
+
+    return target
 
 
 def build_allowed_mentions(mode: str) -> discord.AllowedMentions:
