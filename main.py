@@ -4,7 +4,7 @@ import logging
 import os
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import TracebackType
 from typing import Any
@@ -25,8 +25,9 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
 )
 logger = logging.getLogger("scheduled-discord-bot")
+
 TEST_ROLE_ID = 1203431256419995668
-TEST_CALLBACK_PREFIX = "test_event:"
+DUPLICATE_WINDOW_SECONDS = 300
 
 
 def get_env_first(*names: str) -> str | None:
@@ -37,6 +38,12 @@ def get_env_first(*names: str) -> str | None:
     return None
 
 
+def parse_bool(value: str | None, default: bool = False) -> bool:
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 @dataclass(frozen=True)
 class ScheduledEvent:
     name: str
@@ -45,16 +52,181 @@ class ScheduledEvent:
     reaction: str
     cron: str
     allowed_mentions: str = "none"
+    enabled: bool = True
 
 
 @dataclass(frozen=True)
 class BotConfig:
     events: list[ScheduledEvent]
     timezone: ZoneInfo
+    event_store: "EventStore"
     guild_id: int | None = None
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
     enable_discord_commands: bool = False
+
+
+class EventStore:
+    def __init__(self, path: Path, raw_events_json: str | None = None) -> None:
+        self.path = path
+        self.raw_events_json = raw_events_json
+        self.readonly = raw_events_json is not None
+        self.data: dict[str, Any] = {}
+
+    def load(self) -> list[ScheduledEvent]:
+        if self.raw_events_json:
+            source = "EVENTS_JSON"
+            loaded = json.loads(self.raw_events_json)
+        else:
+            source = str(self.path)
+            loaded = json.loads(self.path.read_text(encoding="utf-8"))
+
+        if isinstance(loaded, list):
+            loaded = {"events": loaded}
+        if not isinstance(loaded, dict):
+            raise ValueError(f"{source} must contain a JSON object or array of events")
+
+        events_raw = loaded.get("events")
+        if not isinstance(events_raw, list):
+            raise ValueError(f"{source} must contain an events array")
+
+        self.data = loaded
+        return self.parse_events(self.data)
+
+    def save(self) -> None:
+        if self.readonly:
+            raise RuntimeError("Cannot save schedule while EVENTS_JSON is used")
+
+        self.path.write_text(
+            json.dumps(self.data, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+
+    def parse_events(self, data: dict[str, Any]) -> list[ScheduledEvent]:
+        default_channel_id = data.get("channel_id")
+        default_role_id = data.get("role_id")
+        default_reaction = data.get("reaction")
+        default_allowed_mentions = data.get("allowed_mentions", "none")
+        raw_events = data.get("events")
+
+        if not isinstance(raw_events, list):
+            raise ValueError("events.json must contain an events array")
+
+        events: list[ScheduledEvent] = []
+        event_names: set[str] = set()
+        for index, item in enumerate(raw_events, start=1):
+            if not isinstance(item, dict):
+                raise ValueError(f"Event #{index} must be a JSON object")
+
+            try:
+                text = str(item["text"])
+                role_id = item.get("role_id", default_role_id)
+                if role_id and not text.startswith("<@&"):
+                    text = f"<@&{int(role_id)}> {text}"
+
+                channel_id = item.get("channel_id", default_channel_id)
+                reaction = item.get("reaction", default_reaction)
+                if channel_id is None:
+                    raise ValueError("channel_id")
+                if reaction is None:
+                    raise ValueError("reaction")
+
+                event = ScheduledEvent(
+                    name=str(item["name"]),
+                    channel_id=int(channel_id),
+                    text=text,
+                    reaction=str(reaction),
+                    cron=str(item["cron"]),
+                    allowed_mentions=str(item.get("allowed_mentions", default_allowed_mentions)),
+                    enabled=bool(item.get("enabled", True)),
+                )
+            except KeyError as exc:
+                raise ValueError(f"Event #{index} is missing required field: {exc.args[0]}") from exc
+            except ValueError as exc:
+                if exc.args and exc.args[0] in {"channel_id", "reaction"}:
+                    raise ValueError(f"Event #{index} is missing required field or default: {exc.args[0]}") from exc
+                raise
+            except TypeError as exc:
+                raise ValueError(f"Event #{index} is missing channel_id, reaction, or another required default") from exc
+
+            if event.name in event_names:
+                raise ValueError(f"Event name must be unique: {event.name}")
+
+            CronTrigger.from_crontab(event.cron)
+            events.append(event)
+            event_names.add(event.name)
+
+        if not events:
+            raise ValueError("events.json must contain at least one event")
+
+        return events
+
+    def events_raw(self) -> list[dict[str, Any]]:
+        events = self.data.setdefault("events", [])
+        if not isinstance(events, list):
+            raise ValueError("events must be a list")
+        return events
+
+    def set_enabled(self, index: int, enabled: bool) -> None:
+        events = self.events_raw()
+        events[index]["enabled"] = enabled
+        self.save()
+
+    def delete_event(self, index: int) -> None:
+        events = self.events_raw()
+        del events[index]
+        self.save()
+
+    def add_event(self, name: str, cron: str, text: str) -> None:
+        CronTrigger.from_crontab(cron)
+
+        events = self.events_raw()
+        if any(str(event.get("name")) == name for event in events if isinstance(event, dict)):
+            raise ValueError(f"Событие с именем {name} уже существует")
+
+        events.append(
+            {
+                "name": name,
+                "text": text,
+                "cron": cron,
+                "enabled": True,
+            }
+        )
+        self.save()
+
+
+class LastSentStore:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.data: dict[str, float] = {}
+        self.load()
+
+    def load(self) -> None:
+        try:
+            if self.path.exists():
+                raw = json.loads(self.path.read_text(encoding="utf-8"))
+                if isinstance(raw, dict):
+                    self.data = {str(key): float(value) for key, value in raw.items()}
+        except Exception:
+            logger.exception("Could not read last sent file %s", self.path)
+            self.data = {}
+
+    def save(self) -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(json.dumps(self.data, indent=2), encoding="utf-8")
+        except Exception:
+            logger.exception("Could not write last sent file %s", self.path)
+
+    def recently_sent(self, event_name: str, window_seconds: int = DUPLICATE_WINDOW_SECONDS) -> bool:
+        last_sent_at = self.data.get(event_name)
+        if last_sent_at is None:
+            return False
+        return datetime.now(timezone.utc).timestamp() - last_sent_at < window_seconds
+
+    def mark_sent(self, event_name: str) -> None:
+        self.data[event_name] = datetime.now(timezone.utc).timestamp()
+        self.save()
 
 
 class TelegramNotifier:
@@ -82,11 +254,11 @@ class TelegramNotifier:
             logger.exception("Telegram API %s failed", method)
             return None
 
-    async def send(self, text: str) -> None:
+    async def send(self, text: str, reply_markup: dict[str, Any] | None = None) -> None:
         if not self.enabled or not self.chat_id:
             return
 
-        await self.send_to_chat(self.chat_id, text)
+        await self.send_to_chat(self.chat_id, text, reply_markup=reply_markup)
 
     async def send_to_chat(
         self,
@@ -116,16 +288,22 @@ class TelegramNotifier:
             },
         )
 
-    async def edit_message_text(self, chat_id: str | int, message_id: int, text: str) -> None:
-        await self.api_request(
-            "editMessageText",
-            {
-                "chat_id": str(chat_id),
-                "message_id": message_id,
-                "text": text[:3900],
-                "disable_web_page_preview": True,
-            },
-        )
+    async def edit_message_text(
+        self,
+        chat_id: str | int,
+        message_id: int,
+        text: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "chat_id": str(chat_id),
+            "message_id": message_id,
+            "text": text[:3900],
+            "disable_web_page_preview": True,
+        }
+        if reply_markup is not None:
+            payload["reply_markup"] = reply_markup
+        await self.api_request("editMessageText", payload)
 
     async def get_updates(self, offset: int | None, timeout_seconds: int = 30) -> list[dict[str, Any]] | None:
         if not self.bot_token:
@@ -193,96 +371,18 @@ class SingleInstanceLock:
             self.file.close()
 
 
-def parse_bool(value: str | None, default: bool = False) -> bool:
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-def read_events() -> list[ScheduledEvent]:
-    raw_events = os.getenv("EVENTS_JSON")
-
-    if raw_events:
-        source = "EVENTS_JSON"
-        data = json.loads(raw_events)
-    else:
-        events_file = Path(os.getenv("EVENTS_FILE", "events.json"))
-        source = str(events_file)
-        data = json.loads(events_file.read_text(encoding="utf-8"))
-
-    if isinstance(data, dict):
-        raw_events_list = data.get("events")
-        defaults = data
-    elif isinstance(data, list):
-        raw_events_list = data
-        defaults = {}
-    else:
-        raise ValueError(f"{source} must contain a JSON object or array of events")
-
-    if not isinstance(raw_events_list, list):
-        raise ValueError(f"{source} must contain an events array")
-
-    default_channel_id = defaults.get("channel_id")
-    default_role_id = defaults.get("role_id")
-    default_reaction = defaults.get("reaction")
-    default_allowed_mentions = defaults.get("allowed_mentions", "none")
-
-    events: list[ScheduledEvent] = []
-    event_names: set[str] = set()
-    for index, item in enumerate(raw_events_list, start=1):
-        if not isinstance(item, dict):
-            raise ValueError(f"Event #{index} must be a JSON object")
-
-        try:
-            text = str(item["text"])
-            role_id = item.get("role_id", default_role_id)
-            if role_id and not text.startswith("<@&"):
-                text = f"<@&{int(role_id)}> {text}"
-
-            channel_id = item.get("channel_id", default_channel_id)
-            reaction = item.get("reaction", default_reaction)
-            if channel_id is None:
-                raise ValueError("channel_id")
-            if reaction is None:
-                raise ValueError("reaction")
-
-            event = ScheduledEvent(
-                name=str(item["name"]),
-                channel_id=int(channel_id),
-                text=text,
-                reaction=str(reaction),
-                cron=str(item["cron"]),
-                allowed_mentions=str(item.get("allowed_mentions", default_allowed_mentions)),
-            )
-        except KeyError as exc:
-            raise ValueError(f"Event #{index} is missing required field: {exc.args[0]}") from exc
-        except ValueError as exc:
-            if exc.args and exc.args[0] in {"channel_id", "reaction"}:
-                raise ValueError(f"Event #{index} is missing required field or default: {exc.args[0]}") from exc
-            raise
-        except TypeError as exc:
-            raise ValueError(f"Event #{index} is missing channel_id, reaction, or another required default") from exc
-
-        if event.name in event_names:
-            raise ValueError(f"Event name must be unique: {event.name}")
-
-        CronTrigger.from_crontab(event.cron)
-        events.append(event)
-        event_names.add(event.name)
-
-    if not events:
-        raise ValueError(f"{source} must contain at least one event")
-
-    return events
-
-
 def read_config() -> BotConfig:
     timezone_name = os.getenv("TIMEZONE", "Europe/Moscow")
     guild_id = int(os.getenv("DISCORD_GUILD_ID", "0") or "0") or None
+    event_store = EventStore(
+        path=Path(os.getenv("EVENTS_FILE", "events.json")),
+        raw_events_json=os.getenv("EVENTS_JSON") or None,
+    )
 
     return BotConfig(
-        events=read_events(),
+        events=event_store.load(),
         timezone=ZoneInfo(timezone_name),
+        event_store=event_store,
         guild_id=guild_id,
         telegram_bot_token=get_env_first("TG_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"),
         telegram_chat_id=get_env_first("TG_CHAT_ID", "TELEGRAM_CHAT_ID"),
@@ -315,6 +415,10 @@ def build_notifier_from_env() -> TelegramNotifier:
     )
 
 
+def data_file(name: str) -> Path:
+    return Path(os.getenv("DATA_DIR", ".")).joinpath(name)
+
+
 async def notify_runtime_error(notifier: TelegramNotifier, exc: BaseException) -> None:
     if str(exc) == "Another bot process is already running":
         await notifier.send(
@@ -336,11 +440,14 @@ class ScheduledDiscordBot(discord.Client):
         super().__init__(intents=intents)
 
         self.events = config.events
+        self.event_store = config.event_store
         self.scheduler = AsyncIOScheduler(timezone=config.timezone)
         self.timezone = config.timezone
         self.guild_id = config.guild_id
         self.enable_discord_commands = config.enable_discord_commands
         self.notifier = notifier
+        self.last_sent_store = LastSentStore(data_file("last_sent.json"))
+        self.pending_actions: dict[str, str] = {}
         self.tree: app_commands.CommandTree | None = None
         self._scheduled = False
         self._commands_synced = False
@@ -365,7 +472,25 @@ class ScheduledDiscordBot(discord.Client):
         if self._scheduled:
             return
 
+        self.rebuild_schedule()
+        self.scheduler.start()
+        self._scheduled = True
+        self.log_next_runs()
+        await self.notify_started()
+        self.start_telegram_commands()
+
+    async def close(self) -> None:
+        if self._telegram_task:
+            self._telegram_task.cancel()
+        await super().close()
+
+    def rebuild_schedule(self) -> None:
+        self.scheduler.remove_all_jobs()
         for event in self.events:
+            if not event.enabled:
+                logger.info("Skipped disabled event %s", event.name)
+                continue
+
             trigger = CronTrigger.from_crontab(event.cron, timezone=self.scheduler.timezone)
             self.scheduler.add_job(
                 self.send_scheduled_message,
@@ -378,16 +503,10 @@ class ScheduledDiscordBot(discord.Client):
             )
             logger.info("Scheduled %s with cron '%s'", event.name, event.cron)
 
-        self.scheduler.start()
-        self._scheduled = True
+    async def reload_events(self) -> None:
+        self.events = self.event_store.load()
+        self.rebuild_schedule()
         self.log_next_runs()
-        await self.notify_started()
-        self.start_telegram_commands()
-
-    async def close(self) -> None:
-        if self._telegram_task:
-            self._telegram_task.cancel()
-        await super().close()
 
     async def sync_discord_commands(self) -> None:
         if not self.enable_discord_commands or self.tree is None or self._commands_synced:
@@ -403,20 +522,15 @@ class ScheduledDiscordBot(discord.Client):
                 synced = await self.tree.sync()
                 logger.info("Synced %s global Discord slash command(s)", len(synced))
         except discord.Forbidden:
-            logger.exception(
-                "Could not sync Discord slash commands. Check DISCORD_GUILD_ID and applications.commands scope. Scheduled messages will still run."
-            )
+            logger.exception("Could not sync Discord slash commands")
             await self.notifier.send(
                 "Discord slash-команды не подключились\n\n"
-                "Команды: /send_now и /next_events\n"
-                "Ошибка: Discord вернул Missing Access\n\n"
                 "Расписание и Telegram-команды продолжат работать."
             )
         except discord.HTTPException as exc:
-            logger.exception("Discord API error while syncing slash commands. Scheduled messages will still run.")
+            logger.exception("Discord API error while syncing slash commands")
             await self.notifier.send(
                 "Discord slash-команды не подключились\n\n"
-                "Команды: /send_now и /next_events\n"
                 f"Ошибка Discord API: {exc}\n\n"
                 "Расписание и Telegram-команды продолжат работать."
             )
@@ -458,9 +572,7 @@ class ScheduledDiscordBot(discord.Client):
     async def get_initial_telegram_offset(self) -> int | None:
         updates = await self.notifier.get_updates(offset=None, timeout_seconds=1)
         if updates is None:
-            logger.error(
-                "Telegram getUpdates failed during startup. Check TELEGRAM_BOT_TOKEN or TG_BOT_TOKEN."
-            )
+            logger.error("Telegram getUpdates failed during startup. Check TELEGRAM_BOT_TOKEN or TG_BOT_TOKEN.")
             return None
 
         update_ids = [update.get("update_id") for update in updates if isinstance(update.get("update_id"), int)]
@@ -488,6 +600,14 @@ class ScheduledDiscordBot(discord.Client):
             return
 
         text = str(message.get("text") or "").strip()
+        if not text:
+            return
+
+        pending_action = self.pending_actions.get(chat_id)
+        if pending_action == "add_event" and not text.startswith("/"):
+            await self.handle_add_event_input(text)
+            return
+
         if not text.startswith("/"):
             return
 
@@ -497,44 +617,130 @@ class ScheduledDiscordBot(discord.Client):
 
         if command in {"/start", "/help"}:
             await self.notifier.send(self.telegram_help_text())
+        elif command == "/status":
+            await self.handle_status()
+        elif command == "/reload":
+            await self.handle_reload()
+        elif command == "/schedule":
+            await self.handle_schedule_menu()
         elif command == "/next_events":
             await self.handle_telegram_next_events(argument)
         elif command == "/send_now":
             await self.handle_telegram_send_now(argument)
         elif command == "/test":
             await self.handle_telegram_test()
+        elif command == "/cancel":
+            self.pending_actions.pop(chat_id, None)
+            await self.notifier.send("Действие отменено.")
         else:
             await self.notifier.send("Неизвестная команда. Напишите /help.")
 
     def telegram_help_text(self) -> str:
         return (
             "Команды админа:\n\n"
+            "/status - статус бота\n"
+            "/schedule - управление расписанием кнопками\n"
+            "/reload - перечитать events.json\n"
             "/next_events - показать 5 ближайших событий\n"
             "/next_events 10 - показать до 10 событий\n"
-            "/send_now - отправить все сообщения сейчас\n"
+            "/send_now - выбрать ручную отправку кнопкой\n"
             "/send_now weekly_25x25_common_monday - отправить одно событие\n"
             "/test - выбрать тестовое событие кнопкой\n"
-            "/help - показать эту подсказку"
+            "/cancel - отменить ввод"
+        )
+
+    async def handle_status(self) -> None:
+        active_count = sum(1 for event in self.events if event.enabled)
+        disabled_count = len(self.events) - active_count
+        await self.notifier.send(
+            "Статус бота\n\n"
+            f"Discord: онлайн как {self.user}\n"
+            f"Часовой пояс: {self.timezone.key}\n"
+            f"Событий всего: {len(self.events)}\n"
+            f"Включено: {active_count}\n"
+            f"Отключено: {disabled_count}\n"
+            f"Telegram-команды: {'включены' if self.notifier.enabled else 'выключены'}\n\n"
+            f"{self.format_next_events(limit=5)}"
+        )
+
+    async def handle_reload(self) -> None:
+        try:
+            await self.reload_events()
+            await self.notifier.send(
+                "Расписание перечитано\n\n"
+                f"Событий: {len(self.events)}\n\n"
+                f"{self.format_next_events(limit=5)}"
+            )
+        except Exception as exc:
+            logger.exception("Could not reload schedule")
+            await self.notifier.send(f"Не удалось перечитать расписание: {type(exc).__name__}: {exc}")
+
+    async def handle_schedule_menu(self) -> None:
+        await self.notifier.send(
+            "Управление расписанием",
+            reply_markup=self.schedule_menu_keyboard(),
         )
 
     async def handle_telegram_test(self) -> None:
-        keyboard = []
-        for index, event in enumerate(self.events):
-            keyboard.append(
-                [
-                    {
-                        "text": event.name,
-                        "callback_data": f"{TEST_CALLBACK_PREFIX}{index}",
-                    }
-                ]
-            )
-
-        await self.notifier.send_to_chat(
-            self.notifier.chat_id or "",
+        await self.notifier.send(
             "Выберите тестовое уведомление для отправки в Discord.\n\n"
             f"В тесте будет тегаться роль: {TEST_ROLE_ID}",
-            reply_markup={"inline_keyboard": keyboard},
+            reply_markup=self.event_keyboard("test"),
         )
+
+    async def handle_telegram_send_now(self, event_name: str) -> None:
+        if not event_name:
+            await self.notifier.send(
+                "Выберите событие для ручной отправки:",
+                reply_markup=self.event_keyboard("send"),
+            )
+            return
+
+        selected_events = self.find_events(event_name)
+        if not selected_events:
+            await self.notifier.send(
+                "Событие не найдено.\n\n"
+                f"Доступные имена:\n{self.format_event_names()}"
+            )
+            return
+
+        await self.send_events_manually(selected_events)
+
+    async def handle_telegram_next_events(self, argument: str) -> None:
+        limit = 5
+        if argument:
+            try:
+                limit = int(argument)
+            except ValueError:
+                await self.notifier.send("Лимит должен быть числом, например: /next_events 10")
+                return
+
+        limit = max(1, min(limit, 10))
+        await self.notifier.send(self.format_next_events(limit=limit))
+
+    async def handle_add_event_input(self, text: str) -> None:
+        try:
+            name, cron, event_text = [part.strip() for part in text.split("|", 2)]
+            if not name or not cron or not event_text:
+                raise ValueError("empty field")
+        except ValueError:
+            await self.notifier.send(
+                "Не понял формат.\n\n"
+                "Отправьте так:\n"
+                "name | cron | text\n\n"
+                "Пример:\n"
+                "weekly_test | 0 19 * * fri | реаки тест"
+            )
+            return
+
+        try:
+            self.event_store.add_event(name=name, cron=cron, text=event_text)
+            await self.reload_events()
+            self.pending_actions.pop(self.notifier.chat_id or "", None)
+            await self.notifier.send(f"Событие добавлено и включено:\n{name}")
+        except Exception as exc:
+            logger.exception("Could not add event")
+            await self.notifier.send(f"Не удалось добавить событие: {type(exc).__name__}: {exc}")
 
     async def handle_telegram_callback(self, callback_query: dict[str, Any]) -> None:
         callback_query_id = str(callback_query.get("id") or "")
@@ -555,77 +761,180 @@ class ScheduledDiscordBot(discord.Client):
                 await self.notifier.answer_callback_query(callback_query_id, "Нет доступа")
             return
 
-        if not data.startswith(TEST_CALLBACK_PREFIX):
-            return
-
-        try:
-            event_index = int(data.removeprefix(TEST_CALLBACK_PREFIX))
-            event = self.events[event_index]
-        except (ValueError, IndexError):
-            if callback_query_id:
-                await self.notifier.answer_callback_query(callback_query_id, "Событие не найдено")
-            return
-
         if callback_query_id:
-            await self.notifier.answer_callback_query(callback_query_id, "Отправляю тест")
+            await self.notifier.answer_callback_query(callback_query_id, "Принято")
 
-        message_id = message.get("message_id")
-        if isinstance(message_id, int):
-            await self.notifier.edit_message_text(
-                chat_id,
-                message_id,
-                f"Выбрано тестовое событие:\n{event.name}\n\nОтправляю в Discord...",
+        if data == "menu:main":
+            await self.edit_callback_message(message, "Управление расписанием", self.schedule_menu_keyboard())
+        elif data == "menu:list":
+            await self.edit_callback_message(message, self.format_events_list(), self.schedule_menu_keyboard())
+        elif data == "menu:toggle":
+            await self.edit_callback_message(message, "Выберите событие для включения/отключения:", self.event_keyboard("toggle"))
+        elif data == "menu:delete":
+            await self.edit_callback_message(message, "Выберите событие для удаления:", self.event_keyboard("delete"))
+        elif data == "menu:add":
+            self.pending_actions[chat_id] = "add_event"
+            await self.edit_callback_message(
+                message,
+                "Добавление события\n\n"
+                "Отправьте следующим сообщением:\n"
+                "name | cron | text\n\n"
+                "Пример:\n"
+                "weekly_test | 0 19 * * fri | реаки тест\n\n"
+                "Для отмены: /cancel",
             )
+        elif data == "menu:reload":
+            await self.handle_reload()
+        elif data.startswith("toggle:"):
+            await self.handle_toggle_callback(message, data)
+        elif data.startswith("delete:"):
+            await self.handle_delete_callback(message, data)
+        elif data.startswith("confirm_delete:"):
+            await self.handle_confirm_delete_callback(message, data)
+        elif data == "send_all":
+            await self.edit_callback_message(message, "Отправляю все включенные события...")
+            await self.send_events_manually([event for event in self.events if event.enabled])
+        elif data.startswith("send:"):
+            await self.handle_send_callback(message, data)
+        elif data.startswith("test:"):
+            await self.handle_test_callback(message, data)
 
-        test_event = self.with_role_override(event, TEST_ROLE_ID)
-        sent = await self.send_scheduled_message(test_event)
+    async def edit_callback_message(
+        self,
+        message: dict[str, Any],
+        text: str,
+        reply_markup: dict[str, Any] | None = None,
+    ) -> None:
+        chat = message.get("chat")
+        message_id = message.get("message_id")
+        if isinstance(chat, dict) and isinstance(message_id, int):
+            await self.notifier.edit_message_text(str(chat.get("id")), message_id, text, reply_markup=reply_markup)
 
-        result_text = "Тестовое уведомление отправлено" if sent else "Тестовое уведомление не отправилось"
-        await self.notifier.send(
-            f"{result_text}\n\n"
-            f"Событие: {event.name}\n"
-            f"Тестовая роль: {TEST_ROLE_ID}"
+    async def handle_toggle_callback(self, message: dict[str, Any], data: str) -> None:
+        index = self.callback_index(data)
+        event = self.event_at(index)
+        if index is None or event is None:
+            await self.edit_callback_message(message, "Событие не найдено. Откройте меню заново.", self.schedule_menu_keyboard())
+            return
+        self.event_store.set_enabled(index, not event.enabled)
+        await self.reload_events()
+        updated = self.events[index]
+        await self.edit_callback_message(
+            message,
+            f"Событие обновлено:\n{self.format_event_line(updated)}",
+            self.event_keyboard("toggle"),
         )
 
-    async def handle_telegram_next_events(self, argument: str) -> None:
-        limit = 5
-        if argument:
-            try:
-                limit = int(argument)
-            except ValueError:
-                await self.notifier.send("Лимит должен быть числом, например: /next_events 10")
-                return
-
-        limit = max(1, min(limit, 10))
-        await self.notifier.send(self.format_next_events(limit=limit))
-
-    async def handle_telegram_send_now(self, event_name: str) -> None:
-        selected_events = self.find_events(event_name)
-        if not selected_events:
-            await self.notifier.send(
-                "Событие не найдено.\n\n"
-                f"Доступные имена:\n{self.format_event_names()}"
-            )
+    async def handle_delete_callback(self, message: dict[str, Any], data: str) -> None:
+        index = self.callback_index(data)
+        event = self.event_at(index)
+        if index is None or event is None:
+            await self.edit_callback_message(message, "Событие не найдено. Откройте меню заново.", self.schedule_menu_keyboard())
             return
+        await self.edit_callback_message(
+            message,
+            f"Удалить событие?\n\n{self.format_event_line(event)}",
+            {
+                "inline_keyboard": [
+                    [{"text": "Удалить", "callback_data": f"confirm_delete:{index}"}],
+                    [{"text": "Назад", "callback_data": "menu:delete"}],
+                ]
+            },
+        )
 
+    async def handle_confirm_delete_callback(self, message: dict[str, Any], data: str) -> None:
+        index = self.callback_index(data)
+        event = self.event_at(index)
+        if index is None or event is None:
+            await self.edit_callback_message(message, "Событие не найдено. Откройте меню заново.", self.schedule_menu_keyboard())
+            return
+        event_name = event.name
+        self.event_store.delete_event(index)
+        await self.reload_events()
+        await self.edit_callback_message(
+            message,
+            f"Событие удалено:\n{event_name}",
+            self.schedule_menu_keyboard(),
+        )
+
+    async def handle_send_callback(self, message: dict[str, Any], data: str) -> None:
+        index = self.callback_index(data)
+        event = self.event_at(index)
+        if index is None or event is None:
+            await self.edit_callback_message(message, "Событие не найдено. Откройте меню заново.", self.schedule_menu_keyboard())
+            return
+        await self.edit_callback_message(message, f"Отправляю событие:\n{event.name}")
+        await self.send_events_manually([event])
+
+    async def handle_test_callback(self, message: dict[str, Any], data: str) -> None:
+        index = self.callback_index(data)
+        event = self.event_at(index)
+        if index is None or event is None:
+            await self.edit_callback_message(message, "Событие не найдено. Откройте меню заново.", self.schedule_menu_keyboard())
+            return
+        await self.edit_callback_message(message, f"Отправляю тестовое событие:\n{event.name}")
+        test_event = self.with_role_override(event, TEST_ROLE_ID)
+        sent = await self.send_scheduled_message(test_event, dedupe=False, notify_success=False)
+        result = "Тестовое уведомление отправлено" if sent else "Тестовое уведомление не отправилось"
+        await self.notifier.send(f"{result}\n\nСобытие: {event.name}\nТестовая роль: {TEST_ROLE_ID}")
+
+    async def send_events_manually(self, events: list[ScheduledEvent]) -> None:
         await self.notifier.send(
             "Запускаю ручную отправку...\n\n"
-            f"Событий к отправке: {len(selected_events)}"
+            f"Событий к отправке: {len(events)}"
         )
 
         sent_count = 0
-        for event in selected_events:
-            if await self.send_scheduled_message(event):
+        for event in events:
+            if await self.send_scheduled_message(event, dedupe=False, notify_success=False):
                 sent_count += 1
 
         await self.notifier.send(
             "Ручная отправка завершена\n\n"
-            f"Отправлено: {sent_count} из {len(selected_events)}"
+            f"Отправлено: {sent_count} из {len(events)}"
         )
+
+    @staticmethod
+    def callback_index(data: str) -> int | None:
+        try:
+            return int(data.split(":", 1)[1])
+        except (IndexError, ValueError):
+            return None
+
+    def event_at(self, index: int | None) -> ScheduledEvent | None:
+        if index is None or index < 0 or index >= len(self.events):
+            return None
+        return self.events[index]
+
+    def schedule_menu_keyboard(self) -> dict[str, Any]:
+        return {
+            "inline_keyboard": [
+                [{"text": "Список событий", "callback_data": "menu:list"}],
+                [{"text": "Добавить событие", "callback_data": "menu:add"}],
+                [{"text": "Включить/отключить", "callback_data": "menu:toggle"}],
+                [{"text": "Удалить событие", "callback_data": "menu:delete"}],
+                [{"text": "Перечитать events.json", "callback_data": "menu:reload"}],
+            ]
+        }
+
+    def event_keyboard(self, action: str) -> dict[str, Any]:
+        keyboard = []
+        if action == "send":
+            keyboard.append([{"text": "Отправить все включенные", "callback_data": "send_all"}])
+        for index, event in enumerate(self.events):
+            keyboard.append([{"text": self.button_label(event), "callback_data": f"{action}:{index}"}])
+        keyboard.append([{"text": "Назад", "callback_data": "menu:main"}])
+        return {"inline_keyboard": keyboard}
+
+    @staticmethod
+    def button_label(event: ScheduledEvent) -> str:
+        status = "Вкл" if event.enabled else "Выкл"
+        clean_text = event.text.split(">", 1)[1].strip() if event.text.startswith("<@&") and ">" in event.text else event.text
+        return f"{status} | {event.cron} | {clean_text[:28]}"
 
     def find_events(self, event_name: str) -> list[ScheduledEvent]:
         if not event_name:
-            return self.events
+            return [event for event in self.events if event.enabled]
         return [event for event in self.events if event.name == event_name]
 
     @staticmethod
@@ -644,14 +953,28 @@ class ScheduledDiscordBot(discord.Client):
             reaction=event.reaction,
             cron=event.cron,
             allowed_mentions=event.allowed_mentions,
+            enabled=event.enabled,
         )
 
     def format_event_names(self) -> str:
         return "\n".join(f"• {event.name}" for event in self.events)
 
+    def format_event_line(self, event: ScheduledEvent) -> str:
+        status = "включено" if event.enabled else "отключено"
+        return f"{event.name}\nСтатус: {status}\nCron: {event.cron}\nТекст: {event.text}"
+
+    def format_events_list(self) -> str:
+        lines = ["События:"]
+        for event in self.events:
+            status = "вкл" if event.enabled else "выкл"
+            lines.append(f"• {event.name} [{status}] — {event.cron}")
+        return "\n".join(lines)
+
     def get_next_runs(self) -> list[tuple[ScheduledEvent, datetime]]:
         next_runs: list[tuple[ScheduledEvent, datetime]] = []
         for event in self.events:
+            if not event.enabled:
+                continue
             job = self.scheduler.get_job(event.name)
             if job is None or job.next_run_time is None:
                 continue
@@ -666,7 +989,7 @@ class ScheduledDiscordBot(discord.Client):
             logger.info("Next %s: %s", event.name, next_run.strftime("%Y-%m-%d %H:%M %Z"))
 
         for event in self.events:
-            if event.name not in logged_events:
+            if event.enabled and event.name not in logged_events:
                 logger.warning("No next run time for %s", event.name)
 
     def format_next_events(self, limit: int = 5) -> str:
@@ -687,12 +1010,24 @@ class ScheduledDiscordBot(discord.Client):
             f"Событий в расписании: {len(self.events)}\n\n"
             f"{self.format_next_events(limit=5)}\n\n"
             "Telegram-команды:\n"
+            "/status\n"
+            "/schedule\n"
             "/next_events\n"
             "/send_now\n"
             "/test"
         )
 
-    async def send_scheduled_message(self, event: ScheduledEvent) -> bool:
+    async def send_scheduled_message(
+        self,
+        event: ScheduledEvent,
+        dedupe: bool = True,
+        notify_success: bool = True,
+    ) -> bool:
+        if dedupe and self.last_sent_store.recently_sent(event.name):
+            logger.warning("Skipped duplicate scheduled send for %s", event.name)
+            await self.notifier.send(f"Пропущен дубль отправки по расписанию\n\nСобытие: {event.name}")
+            return False
+
         try:
             channel = self.get_channel(event.channel_id)
             if channel is None:
@@ -738,6 +1073,14 @@ class ScheduledDiscordBot(discord.Client):
                 )
                 return False
 
+            if dedupe:
+                self.last_sent_store.mark_sent(event.name)
+            if notify_success:
+                await self.notifier.send(
+                    "Сообщение по расписанию отправлено\n\n"
+                    f"Событие: {event.name}\n"
+                    f"Канал: {event.channel_id}"
+                )
             logger.info("Sent scheduled message for event %s", event.name)
             return True
         except discord.Forbidden as exc:
@@ -789,7 +1132,7 @@ class ScheduledDiscordBot(discord.Client):
 
         sent_count = 0
         for event in selected_events:
-            if await self.send_scheduled_message(event):
+            if await self.send_scheduled_message(event, dedupe=False, notify_success=False):
                 sent_count += 1
 
         await interaction.followup.send(

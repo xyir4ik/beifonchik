@@ -7,27 +7,32 @@
     {
       "name": "weekly_15x15_vzp_saturday",
       "text": "реаки 15x15 ВЗП",
-      "cron": "10 18 * * sat"
+      "cron": "10 18 * * sat",
+      "enabled": true
     },
     {
       "name": "weekly_25x25_common_monday",
       "text": "реаки 25x25 общее взх",
-      "cron": "20 18 * * mon"
+      "cron": "20 18 * * mon",
+      "enabled": true
     },
     {
       "name": "weekly_25x25_mafia_tuesday",
       "text": "реаки 25x25 взх мафий",
-      "cron": "20 18 * * tue"
+      "cron": "20 18 * * tue",
+      "enabled": true
     },
     {
       "name": "weekly_25x25_common_thursday",
       "text": "реаки 25x25 общее взх",
-      "cron": "20 18 * * thu"
+      "cron": "20 18 * * thu",
+      "enabled": true
     },
     {
       "name": "weekly_25x25_mafia_sunday",
       "text": "реаки 25x25 взх мафий",
-      "cron": "20 18 * * sun"
+      "cron": "20 18 * * sun",
+      "enabled": true
     }
   ]
 }

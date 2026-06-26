@@ -1,5 +1,7 @@
 .env
 .bot.lock
+last_sent.json
+data/
 __pycache__/
 *.py[cod]
 .venv/
