@@ -469,6 +469,7 @@ class ScheduledDiscordBot(discord.Client):
         self.notifier = notifier
         self.last_sent_store = LastSentStore(data_file("last_sent.json"))
         self.pending_actions: dict[str, str] = {}
+        self.pending_event_drafts: dict[str, dict[str, str]] = {}
         self.tree: app_commands.CommandTree | None = None
         self._scheduled = False
         self._commands_synced = False
@@ -625,8 +626,8 @@ class ScheduledDiscordBot(discord.Client):
             return
 
         pending_action = self.pending_actions.get(chat_id)
-        if pending_action == "add_event" and not text.startswith("/"):
-            await self.handle_add_event_input(text)
+        if pending_action and pending_action.startswith("add_event:") and not text.startswith("/"):
+            await self.handle_add_event_input(chat_id, text)
             return
 
         if not text.startswith("/"):
@@ -650,9 +651,6 @@ class ScheduledDiscordBot(discord.Client):
             await self.handle_telegram_send_now(argument)
         elif command == "/test":
             await self.handle_telegram_test()
-        elif command == "/cancel":
-            self.pending_actions.pop(chat_id, None)
-            await self.notifier.send("Действие отменено.")
         else:
             await self.notifier.send("Неизвестная команда. Напишите /help.")
 
@@ -665,9 +663,7 @@ class ScheduledDiscordBot(discord.Client):
             "/next_events - показать 5 ближайших событий\n"
             "/next_events 10 - показать до 10 событий\n"
             "/send_now - выбрать ручную отправку кнопкой\n"
-            "/send_now weekly_25x25_common_monday - отправить одно событие\n"
-            "/test - выбрать тестовое событие кнопкой\n"
-            "/cancel - отменить ввод"
+            "/test - выбрать тестовое событие кнопкой"
         )
 
     async def handle_status(self) -> None:
@@ -739,29 +735,55 @@ class ScheduledDiscordBot(discord.Client):
         limit = max(1, min(limit, 10))
         await self.notifier.send(self.format_next_events(limit=limit))
 
-    async def handle_add_event_input(self, text: str) -> None:
-        try:
-            name, cron, event_text = [part.strip() for part in text.split("|", 2)]
-            if not name or not cron or not event_text:
-                raise ValueError("empty field")
-        except ValueError:
+    async def handle_add_event_input(self, chat_id: str, text: str) -> None:
+        step = self.pending_actions.get(chat_id)
+        draft = self.pending_event_drafts.setdefault(chat_id, {})
+
+        if step == "add_event:name":
+            draft["name"] = text
+            self.pending_actions[chat_id] = "add_event:text"
             await self.notifier.send(
-                "Не понял формат.\n\n"
-                "Отправьте так:\n"
-                "name | cron | text\n\n"
-                "Пример:\n"
-                "weekly_test | 0 19 * * fri | реаки тест"
+                "Введите текст сообщения.\n\n"
+                "Например:\n"
+                "реаки 25x25 общее взх\n\n"
+                "Роль добавится автоматически.",
+                reply_markup=self.back_keyboard(),
             )
             return
 
-        try:
-            self.event_store.add_event(name=name, cron=cron, text=event_text)
-            await self.reload_events()
-            self.pending_actions.pop(self.notifier.chat_id or "", None)
-            await self.notifier.send(f"Событие добавлено и включено:\n{name}")
-        except Exception as exc:
-            logger.exception("Could not add event")
-            await self.notifier.send(f"Не удалось добавить событие: {type(exc).__name__}: {exc}")
+        if step == "add_event:text":
+            draft["text"] = text
+            self.pending_actions[chat_id] = "add_event:cron"
+            await self.notifier.send(
+                "Введите расписание в формате cron.\n\n"
+                "Примеры:\n"
+                "10 18 * * sat — каждую субботу в 18:10\n"
+                "20 18 * * mon — каждый понедельник в 18:20\n\n"
+                "Дни недели: mon, tue, wed, thu, fri, sat, sun",
+                reply_markup=self.back_keyboard(),
+            )
+            return
+
+        if step == "add_event:cron":
+            draft["cron"] = text
+            try:
+                self.event_store.add_event(name=draft["name"], cron=draft["cron"], text=draft["text"])
+                await self.reload_events()
+                added_event = next(event for event in self.events if event.name == draft["name"])
+                self.clear_pending(chat_id)
+                await self.notifier.send(
+                    "Событие добавлено и включено:\n"
+                    f"{self.event_display(added_event)}",
+                    reply_markup=self.schedule_menu_keyboard(),
+                )
+            except Exception as exc:
+                logger.exception("Could not add event")
+                await self.notifier.send(
+                    "Не удалось добавить событие.\n\n"
+                    f"Ошибка: {type(exc).__name__}: {exc}\n\n"
+                    "Введите cron еще раз или нажмите Назад.",
+                    reply_markup=self.back_keyboard(),
+                )
 
     async def handle_telegram_callback(self, callback_query: dict[str, Any]) -> None:
         callback_query_id = str(callback_query.get("id") or "")
@@ -786,6 +808,7 @@ class ScheduledDiscordBot(discord.Client):
             await self.notifier.answer_callback_query(callback_query_id, "Принято")
 
         if data == "menu:main":
+            self.clear_pending(chat_id)
             await self.edit_callback_message(message, "Управление расписанием", self.schedule_menu_keyboard())
         elif data == "menu:list":
             await self.edit_callback_message(message, self.format_events_list(), self.back_keyboard())
@@ -794,15 +817,14 @@ class ScheduledDiscordBot(discord.Client):
         elif data == "menu:delete":
             await self.edit_callback_message(message, "Выберите событие для удаления:", self.event_keyboard("delete"))
         elif data == "menu:add":
-            self.pending_actions[chat_id] = "add_event"
+            self.pending_actions[chat_id] = "add_event:name"
+            self.pending_event_drafts[chat_id] = {}
             await self.edit_callback_message(
                 message,
                 "Добавление события\n\n"
-                "Отправьте следующим сообщением:\n"
-                "name | cron | text\n\n"
-                "Пример:\n"
-                "weekly_test | 0 19 * * fri | реаки тест\n\n"
-                "Для отмены: /cancel",
+                "Введите название события.\n\n"
+                "Например:\n"
+                "25x25 общее понедельник",
                 self.back_keyboard(),
             )
         elif data == "menu:reload":
@@ -870,12 +892,12 @@ class ScheduledDiscordBot(discord.Client):
         if index is None or event is None:
             await self.edit_callback_message(message, "Событие не найдено. Откройте меню заново.", self.schedule_menu_keyboard())
             return
-        event_name = event.name
+        event_label = self.event_display(event)
         self.event_store.delete_event(index)
         await self.reload_events()
         await self.edit_callback_message(
             message,
-            f"Событие удалено:\n{event_name}",
+            f"Событие удалено:\n{event_label}",
             self.schedule_menu_keyboard(),
         )
 
@@ -885,7 +907,7 @@ class ScheduledDiscordBot(discord.Client):
         if index is None or event is None:
             await self.edit_callback_message(message, "Событие не найдено. Откройте меню заново.", self.schedule_menu_keyboard())
             return
-        await self.edit_callback_message(message, f"Отправляю событие:\n{event.name}")
+        await self.edit_callback_message(message, f"Отправляю событие:\n{self.event_display(event)}")
         await self.send_events_manually([event])
 
     async def handle_test_callback(self, message: dict[str, Any], data: str) -> None:
@@ -894,11 +916,11 @@ class ScheduledDiscordBot(discord.Client):
         if index is None or event is None:
             await self.edit_callback_message(message, "Событие не найдено. Откройте меню заново.", self.schedule_menu_keyboard())
             return
-        await self.edit_callback_message(message, f"Отправляю тестовое событие:\n{event.name}")
+        await self.edit_callback_message(message, f"Отправляю тестовое событие:\n{self.event_display(event)}")
         test_event = self.with_role_override(event, TEST_ROLE_ID)
         sent = await self.send_scheduled_message(test_event, dedupe=False, notify_success=False)
         result = "Тестовое уведомление отправлено" if sent else "Тестовое уведомление не отправилось"
-        await self.notifier.send(f"{result}\n\nСобытие: {event.name}\nТестовая роль: {TEST_ROLE_ID}")
+        await self.notifier.send(f"{result}\n\nСобытие: {self.event_display(event)}\nТестовая роль: {TEST_ROLE_ID}")
 
     async def send_events_manually(self, events: list[ScheduledEvent]) -> None:
         await self.notifier.send(
@@ -927,6 +949,10 @@ class ScheduledDiscordBot(discord.Client):
         if index is None or index < 0 or index >= len(self.events):
             return None
         return self.events[index]
+
+    def clear_pending(self, chat_id: str) -> None:
+        self.pending_actions.pop(chat_id, None)
+        self.pending_event_drafts.pop(chat_id, None)
 
     def schedule_menu_keyboard(self) -> dict[str, Any]:
         return {
@@ -981,12 +1007,12 @@ class ScheduledDiscordBot(discord.Client):
         )
 
     def format_event_names(self) -> str:
-        return "\n".join(f"• {event.name}" for event in self.events)
+        return "\n".join(f"• {self.event_display(event)}" for event in self.events)
 
     def format_event_line(self, event: ScheduledEvent) -> str:
         status = "включено" if event.enabled else "отключено"
         return (
-            f"{self.human_schedule(event)} — {self.clean_event_text(event)}\n"
+            f"{self.event_display(event)}\n"
             f"Статус: {status}\n"
             f"Имя: {event.name}\n"
             f"Cron: {event.cron}"
@@ -996,8 +1022,11 @@ class ScheduledDiscordBot(discord.Client):
         lines = ["События:"]
         for event in self.events:
             status = "вкл" if event.enabled else "выкл"
-            lines.append(f"• {self.human_schedule(event)} — {self.clean_event_text(event)} [{status}]")
+            lines.append(f"• {self.event_display(event)} [{status}]")
         return "\n".join(lines)
+
+    def event_display(self, event: ScheduledEvent) -> str:
+        return f"{self.human_schedule(event)} — {self.clean_event_text(event)}"
 
     @staticmethod
     def clean_event_text(event: ScheduledEvent) -> str:
@@ -1044,9 +1073,10 @@ class ScheduledDiscordBot(discord.Client):
             if not event.enabled:
                 continue
             job = self.scheduler.get_job(event.name)
-            if job is None or job.next_run_time is None:
+            next_run_time = getattr(job, "next_run_time", None)
+            if job is None or next_run_time is None:
                 continue
-            next_runs.append((event, job.next_run_time.astimezone(self.timezone)))
+            next_runs.append((event, next_run_time.astimezone(self.timezone)))
 
         return sorted(next_runs, key=lambda item: item[1])
 
@@ -1067,7 +1097,7 @@ class ScheduledDiscordBot(discord.Client):
 
         lines = ["Ближайшие события:"]
         for event, next_run in next_runs:
-            lines.append(f"• {event.name} — {next_run.strftime('%d.%m.%Y %H:%M МСК')}")
+            lines.append(f"• {self.event_display(event)}")
         return "\n".join(lines)
 
     async def notify_started(self) -> None:
@@ -1093,7 +1123,7 @@ class ScheduledDiscordBot(discord.Client):
     ) -> bool:
         if dedupe and self.last_sent_store.recently_sent(event.name):
             logger.warning("Skipped duplicate scheduled send for %s", event.name)
-            await self.notifier.send(f"Пропущен дубль отправки по расписанию\n\nСобытие: {event.name}")
+            await self.notifier.send(f"Пропущен дубль отправки по расписанию\n\nСобытие: {self.event_display(event)}")
             return False
 
         try:
@@ -1106,7 +1136,7 @@ class ScheduledDiscordBot(discord.Client):
                 logger.error("Channel %s for event %s is not messageable", event.channel_id, event.name)
                 await self.notifier.send(
                     "Ошибка отправки сообщения\n\n"
-                    f"Событие: {event.name}\n"
+                    f"Событие: {self.event_display(event)}\n"
                     f"Канал: {event.channel_id}\n"
                     f"Текст: {event.text}\n\n"
                     "Ошибка: канал не поддерживает отправку сообщений"
@@ -1124,7 +1154,7 @@ class ScheduledDiscordBot(discord.Client):
                 logger.exception("Missing Discord permissions to add reaction for event %s", event.name)
                 await self.notifier.send(
                     "Сообщение отправлено, но реакция не поставилась\n\n"
-                    f"Событие: {event.name}\n"
+                    f"Событие: {self.event_display(event)}\n"
                     f"Канал: {event.channel_id}\n"
                     f"Реакция: {event.reaction}\n\n"
                     "Ошибка: нет прав Discord на добавление реакции"
@@ -1134,7 +1164,7 @@ class ScheduledDiscordBot(discord.Client):
                 logger.exception("Discord API error while adding reaction for event %s", event.name)
                 await self.notifier.send(
                     "Сообщение отправлено, но реакция не поставилась\n\n"
-                    f"Событие: {event.name}\n"
+                    f"Событие: {self.event_display(event)}\n"
                     f"Канал: {event.channel_id}\n"
                     f"Реакция: {event.reaction}\n\n"
                     f"Ошибка Discord API: {exc}"
@@ -1146,7 +1176,7 @@ class ScheduledDiscordBot(discord.Client):
             if notify_success:
                 await self.notifier.send(
                     "Сообщение по расписанию отправлено\n\n"
-                    f"Событие: {event.name}\n"
+                    f"Событие: {self.event_display(event)}\n"
                     f"Канал: {event.channel_id}"
                 )
             logger.info("Sent scheduled message for event %s", event.name)
@@ -1155,7 +1185,7 @@ class ScheduledDiscordBot(discord.Client):
             logger.exception("Missing Discord permissions for event %s", event.name)
             await self.notifier.send(
                 "Ошибка отправки сообщения\n\n"
-                f"Событие: {event.name}\n"
+                f"Событие: {self.event_display(event)}\n"
                 f"Канал: {event.channel_id}\n"
                 f"Текст: {event.text}\n\n"
                 f"Ошибка: нет прав Discord на отправку сообщения\n{exc}"
@@ -1164,7 +1194,7 @@ class ScheduledDiscordBot(discord.Client):
             logger.exception("Discord API error while sending event %s", event.name)
             await self.notifier.send(
                 "Ошибка отправки сообщения\n\n"
-                f"Событие: {event.name}\n"
+                f"Событие: {self.event_display(event)}\n"
                 f"Канал: {event.channel_id}\n"
                 f"Текст: {event.text}\n\n"
                 f"Ошибка Discord API: {exc}"
@@ -1173,7 +1203,7 @@ class ScheduledDiscordBot(discord.Client):
             logger.exception("Unexpected error while sending event %s", event.name)
             await self.notifier.send(
                 "Неожиданная ошибка отправки сообщения\n\n"
-                f"Событие: {event.name}\n"
+                f"Событие: {self.event_display(event)}\n"
                 f"Канал: {event.channel_id}\n"
                 f"Текст: {event.text}\n\n"
                 f"Ошибка: {type(exc).__name__}: {exc}"
