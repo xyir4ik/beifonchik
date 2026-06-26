@@ -16,7 +16,7 @@
 
 ## Telegram-Команды
 
-Команды доступны только чату из `TG_CHAT_ID`.
+Команды доступны только чату из `TG_CHAT_ID`. Если добавить `TG_ADMIN_USER_ID`, бот дополнительно будет проверять Telegram user id отправителя. Это полезно, если команды используются в группе.
 
 ```text
 /status
@@ -127,11 +127,25 @@ LOG_LEVEL=INFO
 LOCK_FILE=.bot.lock
 TG_BOT_TOKEN=токен_telegram_бота
 TG_CHAT_ID=ваш_chat_id
+TG_ADMIN_USER_ID=
 ENABLE_DISCORD_COMMANDS=false
 DISCORD_GUILD_ID=
 ```
 
 Используйте именно `TG_BOT_TOKEN`, потому что BotHost может иметь системную переменную `TELEGRAM_BOT_TOKEN`.
+
+`TG_ADMIN_USER_ID` необязателен. Если оставить пустым, доступ ограничивается только `TG_CHAT_ID`.
+
+## Структура Кода
+
+- `main.py` — точка входа и обработка аварийного завершения;
+- `bot_client.py` — Discord-клиент и slash-команды, если они включены;
+- `schedule_service.py` — расписание, перезагрузка событий, ручная и тестовая отправка;
+- `telegram_admin.py` — Telegram-команды, кнопки и пошаговое добавление событий;
+- `discord_publisher.py` — отправка сообщений в Discord и постановка реакции;
+- `stores.py` — чтение/запись расписания и антидубль;
+- `formatting.py` — отображение событий в человекочитаемом виде;
+- `app_config.py` — переменные окружения и загрузка конфига.
 
 ## Права Discord-Бота
 

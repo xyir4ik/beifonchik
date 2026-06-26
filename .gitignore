@@ -5,6 +5,7 @@ data/
 .data*/
 __pycache__/
 *.py[cod]
+*.tmp
 .venv/
 venv/
 .idea/
