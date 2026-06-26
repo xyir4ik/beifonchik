@@ -1,9 +1,10 @@
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from typing import Any
 
-from constants import TEST_ROLE_ID
+from constants import MANUAL_SEND_COOLDOWN_SECONDS, TEST_ROLE_ID
 from formatting import EventFormatter
 from models import ScheduledEvent
 from schedule_service import ScheduleService
@@ -27,6 +28,7 @@ class TelegramAdminBot:
         self.discord_user_label = discord_user_label
         self.pending_actions: dict[str, str] = {}
         self.pending_event_drafts: dict[str, dict[str, str]] = {}
+        self.last_manual_send_at: dict[str, float] = {}
         self.task: asyncio.Task[None] | None = None
 
     def start(self) -> None:
@@ -199,7 +201,13 @@ class TelegramAdminBot:
             )
             return
 
-        await self.schedule.send_events_manually(selected_events)
+        event = selected_events[0]
+        index = self.schedule.events.index(event)
+        await self.notifier.send(
+            "Подтвердите ручную отправку.\n\n"
+            f"{self.formatter.event_display(event)}",
+            reply_markup=self.confirm_keyboard(f"confirm_send:{index}", "send"),
+        )
 
     async def handle_next_events(self, argument: str) -> None:
         limit = 5
@@ -328,6 +336,15 @@ class TelegramAdminBot:
             await self.edit_callback_message(message, "Управление расписанием", self.schedule_menu_keyboard())
         elif data == "menu:list":
             await self.edit_callback_message(message, self.formatter.events_list(self.schedule.events), self.back_keyboard())
+        elif data == "menu:send":
+            await self.edit_callback_message(message, "Выберите событие для ручной отправки:", self.event_keyboard("send"))
+        elif data == "menu:test":
+            await self.edit_callback_message(
+                message,
+                "Выберите тестовое уведомление для отправки в Discord.\n\n"
+                f"В тесте будет тегаться роль: {TEST_ROLE_ID}",
+                self.event_keyboard("test"),
+            )
         elif data == "menu:toggle":
             await self.edit_callback_message(message, "Выберите событие для включения/отключения:", self.event_keyboard("toggle"))
         elif data == "menu:edit":
@@ -351,6 +368,8 @@ class TelegramAdminBot:
             await self.handle_toggle_callback(message, data)
         elif data.startswith("edit_field:"):
             await self.handle_edit_field_callback(message, chat_id, data)
+        elif data.startswith("edit_toggle:"):
+            await self.handle_edit_toggle_callback(message, data)
         elif data.startswith("edit:"):
             await self.handle_edit_callback(message, data)
         elif data.startswith("delete:"):
@@ -358,8 +377,11 @@ class TelegramAdminBot:
         elif data.startswith("confirm_delete:"):
             await self.handle_confirm_delete_callback(message, data)
         elif data == "send_all":
-            await self.edit_callback_message(message, "Отправляю все включенные события...")
-            await self.schedule.send_events_manually([event for event in self.schedule.events if event.enabled])
+            await self.handle_send_all_callback(message)
+        elif data.startswith("confirm_send:"):
+            await self.handle_confirm_send_callback(message, chat_id, data)
+        elif data.startswith("confirm_test:"):
+            await self.handle_confirm_test_callback(message, chat_id, data)
         elif data.startswith("send:"):
             await self.handle_send_callback(message, data)
         elif data.startswith("test:"):
@@ -423,6 +445,22 @@ class TelegramAdminBot:
             self.back_to_edit_keyboard(index),
         )
 
+    async def handle_edit_toggle_callback(self, message: dict[str, Any], data: str) -> None:
+        index = self.callback_index(data)
+        event = self.schedule.event_at(index)
+        if index is None or event is None:
+            await self.edit_callback_message(message, "Событие не найдено. Откройте меню заново.", self.schedule_menu_keyboard())
+            return
+
+        self.schedule.toggle_enabled(index)
+        await self.schedule.reload_events()
+        updated = self.schedule.events[index]
+        await self.edit_callback_message(
+            message,
+            f"Событие обновлено:\n{self.formatter.event_line(updated)}",
+            self.edit_field_keyboard(index),
+        )
+
     async def handle_delete_callback(self, message: dict[str, Any], data: str) -> None:
         index = self.callback_index(data)
         event = self.schedule.event_at(index)
@@ -461,8 +499,40 @@ class TelegramAdminBot:
         if index is None or event is None:
             await self.edit_callback_message(message, "Событие не найдено. Откройте меню заново.", self.schedule_menu_keyboard())
             return
-        await self.edit_callback_message(message, f"Отправляю событие:\n{self.formatter.event_display(event)}")
-        await self.schedule.send_events_manually([event])
+        await self.edit_callback_message(
+            message,
+            "Подтвердите ручную отправку.\n\n"
+            f"{self.formatter.event_display(event)}",
+            self.confirm_keyboard(f"confirm_send:{index}", "send"),
+        )
+
+    async def handle_send_all_callback(self, message: dict[str, Any]) -> None:
+        enabled_events = [event for event in self.schedule.events if event.enabled]
+        await self.edit_callback_message(
+            message,
+            "Подтвердите ручную отправку всех включенных событий.\n\n"
+            f"Событий к отправке: {len(enabled_events)}",
+            self.confirm_keyboard("confirm_send:all", "send"),
+        )
+
+    async def handle_confirm_send_callback(self, message: dict[str, Any], chat_id: str, data: str) -> None:
+        if not await self.check_manual_send_cooldown(chat_id):
+            return
+
+        target = data.split(":", 1)[1]
+        if target == "all":
+            events = [event for event in self.schedule.events if event.enabled]
+        else:
+            index = self.callback_index(data)
+            event = self.schedule.event_at(index)
+            if index is None or event is None:
+                await self.edit_callback_message(message, "Событие не найдено. Откройте меню заново.", self.schedule_menu_keyboard())
+                return
+            events = [event]
+
+        self.mark_manual_send(chat_id)
+        await self.edit_callback_message(message, "Отправляю подтвержденную ручную отправку...")
+        await self.schedule.send_events_manually(events)
 
     async def handle_test_callback(self, message: dict[str, Any], data: str) -> None:
         index = self.callback_index(data)
@@ -470,6 +540,25 @@ class TelegramAdminBot:
         if index is None or event is None:
             await self.edit_callback_message(message, "Событие не найдено. Откройте меню заново.", self.schedule_menu_keyboard())
             return
+        await self.edit_callback_message(
+            message,
+            "Подтвердите тестовую отправку.\n\n"
+            f"{self.formatter.event_display(event)}\n"
+            f"Тестовая роль: {TEST_ROLE_ID}",
+            self.confirm_keyboard(f"confirm_test:{index}", "test"),
+        )
+
+    async def handle_confirm_test_callback(self, message: dict[str, Any], chat_id: str, data: str) -> None:
+        if not await self.check_manual_send_cooldown(chat_id):
+            return
+
+        index = self.callback_index(data)
+        event = self.schedule.event_at(index)
+        if index is None or event is None:
+            await self.edit_callback_message(message, "Событие не найдено. Откройте меню заново.", self.schedule_menu_keyboard())
+            return
+
+        self.mark_manual_send(chat_id)
         await self.edit_callback_message(message, f"Отправляю тестовое событие:\n{self.formatter.event_display(event)}")
         sent = await self.schedule.send_test_event(event)
         result = "Тестовое уведомление отправлено" if sent else "Тестовое уведомление не отправилось"
@@ -522,6 +611,10 @@ class TelegramAdminBot:
                 [{"text": "Название", "callback_data": f"edit_field:{index}:name"}],
                 [{"text": "Текст", "callback_data": f"edit_field:{index}:text"}],
                 [{"text": "Расписание", "callback_data": f"edit_field:{index}:cron"}],
+                [{"text": "Канал", "callback_data": f"edit_field:{index}:channel_id"}],
+                [{"text": "Роль", "callback_data": f"edit_field:{index}:role_id"}],
+                [{"text": "Реакция", "callback_data": f"edit_field:{index}:reaction"}],
+                [{"text": "Включить/отключить", "callback_data": f"edit_toggle:{index}"}],
                 [{"text": "Назад", "callback_data": "menu:edit"}],
             ]
         }
@@ -551,17 +644,62 @@ class TelegramAdminBot:
                 "Дни недели: mon, tue, wed, thu, fri, sat, sun\n\n"
                 f"Сейчас:\n{self.formatter.event_display(event)}"
             )
+        if field == "channel_id":
+            return (
+                "Введите новый ID Discord-канала.\n\n"
+                "Например:\n"
+                "1199512515755909171\n\n"
+                f"Сейчас: {event.channel_id}"
+            )
+        if field == "role_id":
+            return (
+                "Введите новый ID Discord-роли.\n\n"
+                "Например:\n"
+                "1199509896069124106\n\n"
+                "В текст роль добавлять не нужно."
+            )
+        if field == "reaction":
+            return (
+                "Введите новую реакцию.\n\n"
+                "Например:\n"
+                "✅"
+            )
         return "Введите новое значение."
 
     @staticmethod
     def edit_field_callback_data(data: str) -> tuple[int, str] | None:
         try:
             _, raw_index, field = data.split(":", 2)
-            if field not in {"name", "text", "cron"}:
+            if field not in {"name", "text", "cron", "channel_id", "role_id", "reaction"}:
                 return None
             return int(raw_index), field
         except ValueError:
             return None
+
+    @staticmethod
+    def confirm_keyboard(confirm_callback: str, back_action: str) -> dict[str, Any]:
+        return {
+            "inline_keyboard": [
+                [{"text": "Подтвердить", "callback_data": confirm_callback}],
+                [{"text": "Назад", "callback_data": f"menu:{back_action}"}],
+            ]
+        }
+
+    async def check_manual_send_cooldown(self, chat_id: str) -> bool:
+        now = time.monotonic()
+        last_at = self.last_manual_send_at.get(chat_id, 0)
+        remaining = int(MANUAL_SEND_COOLDOWN_SECONDS - (now - last_at))
+        if remaining <= 0:
+            return True
+
+        await self.notifier.send(
+            "Ручная отправка временно заблокирована.\n\n"
+            f"Повторите через {remaining} сек."
+        )
+        return False
+
+    def mark_manual_send(self, chat_id: str) -> None:
+        self.last_manual_send_at[chat_id] = time.monotonic()
 
     def is_authorized(
         self,
@@ -573,7 +711,8 @@ class TelegramAdminBot:
             return False
 
         if not self.notifier.admin_user_id:
-            return True
+            logger.warning("Ignoring Telegram command because TG_ADMIN_USER_ID is not set")
+            return False
 
         source = callback_query if callback_query is not None else message
         sender = source.get("from")

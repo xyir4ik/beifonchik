@@ -143,8 +143,8 @@ class EventStore:
         self.save()
 
     def update_event_field(self, index: int, field: str, value: str) -> None:
-        if field not in {"name", "text", "cron"}:
-            raise ValueError("Можно изменить только название, текст или расписание")
+        if field not in {"name", "text", "cron", "channel_id", "role_id", "reaction"}:
+            raise ValueError("Можно изменить только название, текст, расписание, канал, роль или реакцию")
 
         events = self.events_raw()
         if index < 0 or index >= len(events):
@@ -168,10 +168,27 @@ class EventStore:
                 raise ValueError(f"Событие с именем {value} уже существует")
         elif field == "cron":
             self.validate_cron(value)
+        elif field == "channel_id":
+            event[field] = int(value)
+            self.parse_events(self.data)
+            self.save()
+            return
+        elif field == "role_id":
+            event[field] = int(value)
+            event["text"] = self.strip_role_mention(str(event.get("text", "")))
+            self.parse_events(self.data)
+            self.save()
+            return
 
         event[field] = value
         self.parse_events(self.data)
         self.save()
+
+    @staticmethod
+    def strip_role_mention(text: str) -> str:
+        if text.startswith("<@&") and ">" in text:
+            return text.split(">", 1)[1].strip()
+        return text
 
     @staticmethod
     def validate_cron(cron: str) -> None:

@@ -111,6 +111,12 @@ class ScheduleService:
     def update_event_field(self, index: int, field: str, value: str) -> None:
         self.event_store.update_event_field(index=index, field=field, value=value)
 
+    def toggle_enabled(self, index: int) -> None:
+        event = self.event_at(index)
+        if event is None:
+            raise IndexError("Событие не найдено")
+        self.event_store.set_enabled(index, not event.enabled)
+
     async def send_events_manually(self, events: list[ScheduledEvent]) -> None:
         await self.notifier.send(
             "Запускаю ручную отправку...\n\n"
